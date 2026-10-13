@@ -11,13 +11,18 @@
 
 const API = "https://v3.football.api-sports.io";
 const SEASON = 2026;
-const VERSION = 4;
+const VERSION = 5;
 const DAILY_LIMIT = 100;
 const CAP = 95; // 5 Anfragen bleiben als Reserve
 const FINISHED = ["FT", "AET", "PEN"];
 const STOP = FINISHED.concat(["PST", "CANC", "ABD", "AWD", "WO"]);
 const PLAYING = ["1H", "2H", "HT", "ET", "BT", "P", "LIVE", "INT", "SUSP"];
 const LEAGUE_NAMES = { 203: "Süper Lig", 2: "Champions League", 206: "Türkiye Kupası" };
+
+// Welche Nachrichten verschickt werden (in der App unter Live → Hintergrund-Helfer einstellbar)
+const DEFAULT_PREFS = { reminder: true, lineup: true, kickoff: true, goals: true, oppgoals: true, cards: true, var: true, ht: true, ft: true, rivals: true, chance: true, stats: true };
+let PREFS = Object.assign({}, DEFAULT_PREFS);
+function setPrefs(s) { PREFS = Object.assign({}, DEFAULT_PREFS, s.prefs || {}); }
 
 export default {
   async scheduled(event, env, ctx) {
@@ -32,8 +37,21 @@ export default {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
     };
+    headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
     if (req.method === "OPTIONS") return new Response(null, { headers });
     try {
+      if (url.pathname === "/settings") {
+        const s = await load(env);
+        if (req.method === "POST") {
+          let body = {};
+          try { body = JSON.parse(await req.text()); } catch (e) { /* leer */ }
+          const next = Object.assign({}, DEFAULT_PREFS, s.prefs || {});
+          Object.keys(DEFAULT_PREFS).forEach((k) => { if (typeof body[k] === "boolean") next[k] = body[k]; });
+          s.prefs = next;
+          await save(env, s);
+        }
+        return new Response(JSON.stringify({ prefs: Object.assign({}, DEFAULT_PREFS, s.prefs || {}) }), { headers });
+      }
       if (url.pathname === "/state") {
         const s = await load(env);
         return new Response(JSON.stringify(publicState(s, env)), { headers });
@@ -90,6 +108,7 @@ function publicState(s, env) {
     v: VERSION, now: Date.now(), syncedAt: s.syncedAt, fixtures: s.fixtures, table: s.table,
     live: s.live, lastLive: s.lastLive, lineups: s.lineups, usage: s.usage, lastPollAt: s.lastPollAt,
     error: s.error, pushError: s.pushError || "", push: !!env.NTFY_TOPIC, apiKey: !!env.API_KEY,
+    prefs: Object.assign({}, DEFAULT_PREFS, s.prefs || {}),
     rivals: (s.rivalFx || []).map((r) => ({ id: r.id, date: r.date, h: r.h, a: r.a, st: r.st, gh: r.gh, ga: r.ga })),
   };
 }
@@ -166,6 +185,7 @@ async function api(env, s, path) {
 // Schickt eine Nachricht an ntfy. Gibt { ok, error } zurück.
 // Optional: NTFY_TOKEN (Zugangs-Token eines kostenlosen ntfy-Kontos), falls ntfy Anfragen von Cloudflare drosselt.
 async function push(env, msg) {
+  if (msg.cat && PREFS[msg.cat] === false) return { ok: true, skipped: true };
   if (!env.NTFY_TOPIC) return { ok: false, error: "NTFY_TOPIC fehlt" };
   const server = (env.NTFY_SERVER || "https://ntfy.sh").replace(/\/+$/, "");
   const auth = env.NTFY_TOKEN ? { Authorization: "Bearer " + env.NTFY_TOKEN } : {};
@@ -240,6 +260,7 @@ function liveChance(f) {
   return outcome(FB_RATING, rating(opName, f.league.id), neutral ? 0 : fbHome ? 3 : -3, fbHome ? [gh, ga] : [ga, gh], rest, fbReds, opReds);
 }
 function chanceLine(f) {
+  if (!PREFS.chance) return "";
   const c = liveChance(f);
   if (!c) return "";
   return "\nSiegchance jetzt " + pct(c.w) + " · Remis " + pct(c.d);
@@ -296,6 +317,7 @@ async function sync(env, s) {
 // ---------------------------------------------------------------------------
 async function tick(env) {
   const s = await load(env);
+  setPrefs(s);
   const now = Date.now();
   let dirty = false;
   if (s.usage.day !== utcDay()) { s.usage = { day: utcDay(), n: 0 }; dirty = true; }
@@ -345,7 +367,7 @@ async function tick(env) {
         const mine = res.find((x) => isFb(x.team.name));
         if (mine && mine.startXI && mine.startXI.length) {
           s.lineups = { [n.id]: { team: { name: mine.team.name }, formation: mine.formation, coach: mine.coach ? { name: mine.coach.name } : null, startXI: mine.startXI.map((x) => ({ player: { name: x.player.name, number: x.player.number, pos: x.player.pos } })) } };
-          await push(env, { title: "Aufstellung Fenerbahçe", message: (mine.formation ? mine.formation + ": " : "") + mine.startXI.map((x) => x.player.name).join(", "), tags: ["clipboard"], priority: 2 });
+          await push(env, { cat: "lineup", title: "Aufstellung Fenerbahçe", message: (mine.formation ? mine.formation + ": " : "") + mine.startXI.map((x) => x.player.name).join(", "), tags: ["clipboard"], priority: 2 });
         }
       } catch (e) { s.error = String(e.message || e); }
       dirty = true;
@@ -360,7 +382,7 @@ async function tick(env) {
     const neutral = /final/i.test(todayFx.round || "") && todayFx.lg !== 203;
     const c = outcome(FB_RATING, rating(opp, todayFx.lg), neutral ? 0 : fbHome ? 3 : -3, [0, 0], 1, 0, 0);
     await push(env, {
-      title: "Heute spielt Fener! " + berlin(kick(todayFx), { hour: "2-digit", minute: "2-digit" }) + " Uhr",
+      cat: "reminder", title: "Heute spielt Fener! " + berlin(kick(todayFx), { hour: "2-digit", minute: "2-digit" }) + " Uhr",
       message: todayFx.h + " – " + todayFx.a + " (" + (LEAGUE_NAMES[todayFx.lg] || "") + ")\nPrognose: Sieg " + pct(c.w) + " · Remis " + pct(c.d) + " · Niederlage " + pct(c.l) + "\nSchon getippt? Tippspiel in der Fener-App.",
       tags: ["calendar", "soccer"], priority: 3,
     });
@@ -412,7 +434,7 @@ async function pushRival(env, s, r) {
     const gap = fbRow.pts - rvPts;
     msg += "\n" + (gap > 0 ? "Fener " + gap + (gap === 1 ? " Punkt" : " Punkte") + " vor " + name : gap < 0 ? "Fener " + -gap + (gap === -1 ? " Punkt" : " Punkte") + " hinter " + name : "Fener und " + name + " punktgleich") + " (Fener hat " + fbRow.p + ", " + name + " " + (rvRow.p + (already ? 0 : 1)) + " Spiele).";
   }
-  await push(env, { title: title, message: msg, tags: res === "l" ? ["tada"] : res === "d" ? ["neutral_face"] : ["pensive"], priority: res === "w" ? 2 : 3 });
+  await push(env, { cat: "rivals", title: title, message: msg, tags: res === "l" ? ["tada"] : res === "d" ? ["neutral_face"] : ["pensive"], priority: res === "w" ? 2 : 3 });
 }
 
 // Das Tagesbudget gleichmäßig auf die restliche Spielzeit verteilen (ca. alle 60–80 Sekunden)
@@ -461,6 +483,7 @@ function slimStats(list, homeName) {
 }
 function statVal(f, t) { const r = (f.stats || []).find((x) => x.t === t); return r ? [r.h, r.a] : null; }
 function statsLine(f) {
+  if (!PREFS.stats) return "";
   const p = statVal(f, "Ball Possession"), sh = statVal(f, "Total Shots"), xg = statVal(f, "expected_goals");
   const parts = [];
   if (p) parts.push("Ballbesitz " + String(p[0]).replace("%", "") + ":" + String(p[1]).replace("%", ""));
@@ -490,13 +513,13 @@ async function handleUpdate(env, s, w, raw) {
     N.init = true;
     if (PLAYING.indexOf(st) >= 0 && (f.events.length || (f.fixture.status.elapsed || 0) > 3)) {
       N.ko = true; N.ev = f.events.map(evKey); N.gh = gh; N.ga = ga; if (st === "HT") N.ht = true;
-      await push(env, { title: "Fener live · " + comp, message: "Der Helfer ist dabei: " + line + " (" + (f.fixture.status.elapsed || 0) + "')", tags: ["soccer"], priority: 3 });
+      await push(env, { cat: "kickoff", title: "Fener live · " + comp, message: "Der Helfer ist dabei: " + line + " (" + (f.fixture.status.elapsed || 0) + "')", tags: ["soccer"], priority: 3 });
     }
   }
 
   if (!N.ko && PLAYING.indexOf(st) >= 0) {
     N.ko = true;
-    await push(env, { title: "Anpfiff · " + comp, message: h + " – " + a + " läuft!", tags: ["stopwatch"], priority: 3 });
+    await push(env, { cat: "kickoff", title: "Anpfiff · " + comp, message: h + " – " + a + " läuft!", tags: ["stopwatch"], priority: 3 });
   }
 
   let goalPushed = false;
@@ -510,26 +533,26 @@ async function handleUpdate(env, s, w, raw) {
       const how = e.detail === "Penalty" ? " (Elfmeter)" : e.detail === "Own Goal" ? " (Eigentor)" : "";
       const as = e.assist && e.assist.name ? ", Vorlage " + e.assist.name : "";
       await push(env, fb
-        ? { title: "⚽ TOR für Fenerbahçe!", message: e.player.name + how + " " + minute(e) + as + "\n" + line + chanceLine(f), tags: ["soccer", "yellow_heart", "blue_heart"], priority: 5 }
-        : { title: "Gegentor · " + e.team.name, message: e.player.name + how + " " + minute(e) + "\n" + line + chanceLine(f), tags: ["soccer"], priority: 4 });
+        ? { cat: "goals", title: "⚽ TOR für Fenerbahçe!", message: e.player.name + how + " " + minute(e) + as + "\n" + line + chanceLine(f), tags: ["soccer", "yellow_heart", "blue_heart"], priority: 5 }
+        : { cat: "oppgoals", title: "Gegentor · " + e.team.name, message: e.player.name + how + " " + minute(e) + "\n" + line + chanceLine(f), tags: ["soccer"], priority: 4 });
     } else if (e.type === "Goal" && e.detail === "Missed Penalty") {
-      await push(env, { title: "Elfmeter verschossen", message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line, tags: ["x"], priority: 3 });
+      await push(env, { cat: "cards", title: "Elfmeter verschossen", message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line, tags: ["x"], priority: 3 });
     } else if (e.type === "Card" && /Red|Second/.test(e.detail)) {
-      await push(env, { title: "🟥 Rote Karte" + (fb ? " für Fener" : ""), message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line + chanceLine(f), tags: ["red_circle"], priority: 4 });
+      await push(env, { cat: "cards", title: "🟥 Rote Karte" + (fb ? " für Fener" : ""), message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line + chanceLine(f), tags: ["red_circle"], priority: 4 });
     } else if (e.type === "Var" && /cancel|disallow/i.test(e.detail || "")) {
-      await push(env, { title: "Videobeweis: Tor zurückgenommen", message: (e.player.name ? e.player.name + " " : "") + minute(e) + "\n" + line, tags: ["tv"], priority: 4 });
+      await push(env, { cat: "var", title: "Videobeweis: Tor zurückgenommen", message: (e.player.name ? e.player.name + " " : "") + minute(e) + "\n" + line, tags: ["tv"], priority: 4 });
     }
   }
   // Falls ein Tor ohne Ereignis-Daten auftaucht
   if (!goalPushed && gh + ga > N.gh + N.ga) {
     const fbScored = (fbHome ? gh > N.gh : ga > N.ga);
-    await push(env, { title: fbScored ? "⚽ TOR für Fenerbahçe!" : "Gegentor", message: line + chanceLine(f), tags: ["soccer"], priority: fbScored ? 5 : 4 });
+    await push(env, { cat: fbScored ? "goals" : "oppgoals", title: fbScored ? "⚽ TOR für Fenerbahçe!" : "Gegentor", message: line + chanceLine(f), tags: ["soccer"], priority: fbScored ? 5 : 4 });
   }
   N.gh = gh; N.ga = ga;
 
   if (!N.ht && st === "HT") {
     N.ht = true;
-    await push(env, { title: "Halbzeit", message: line + statsLine(f) + chanceLine(f), tags: ["pause_button"], priority: 2 });
+    await push(env, { cat: "ht", title: "Halbzeit", message: line + statsLine(f) + chanceLine(f), tags: ["pause_button"], priority: 2 });
   }
   if (!N.ft && FINISHED.indexOf(st) >= 0) {
     N.ft = true;
@@ -537,9 +560,28 @@ async function handleUpdate(env, s, w, raw) {
     let verdict = fg > og ? "Sieg! 💛💙" : fg < og ? "Niederlage." : "Unentschieden.";
     const ph = f.score.penalty.home, pa = f.score.penalty.away;
     if (ph !== null && pa !== null) verdict = ((fbHome ? ph > pa : pa > ph) ? "Weiter im Elfmeterschießen! " : "Raus im Elfmeterschießen. ") + ph + ":" + pa + " i.E.";
-    await push(env, { title: "Abpfiff · " + comp, message: line + "\n" + verdict + statsLine(f), tags: ["checkered_flag"], priority: 4 });
-    s.lastLive = f;
+    await push(env, { cat: "ft", title: "Abpfiff · " + comp, message: line + "\n" + verdict + statsLine(f), tags: ["checkered_flag"], priority: 4 });
+    N.ftPending = true;
   }
+
+  // Verlauf der Siegchance für die Grafik in der App
+  if (!s.chanceLog || s.chanceLog.id !== id) {
+    const opp = fbHome ? a : h;
+    const neutral = /final/i.test(f.league.round || "") && f.league.id !== 203;
+    const pre = outcome(FB_RATING, rating(opp, f.league.id), neutral ? 0 : fbHome ? 3 : -3, [0, 0], 1, 0, 0);
+    s.chanceLog = { id: id, pts: [{ m: 0, w: Math.round(pre.w * 100), d: Math.round(pre.d * 100) }] };
+  }
+  const el = (f.fixture.status.elapsed || 0) + (f.fixture.status.extra || 0);
+  const lastPt = s.chanceLog.pts[s.chanceLog.pts.length - 1];
+  if (FINISHED.indexOf(st) >= 0) {
+    const fg = fbHome ? gh : ga, og = fbHome ? ga : gh;
+    if (lastPt.m < 200) s.chanceLog.pts.push({ m: Math.max(90, el, lastPt.m + 1), w: fg > og ? 100 : 0, d: fg === og ? 100 : 0, end: true });
+  } else {
+    const c = liveChance(f);
+    if (c && el > lastPt.m) s.chanceLog.pts.push({ m: el, w: Math.round(c.w * 100), d: Math.round(c.d * 100) });
+  }
+  f.chance = s.chanceLog.pts;
+  if (N.ftPending) { N.ftPending = false; s.lastLive = f; }
 
   // Spielplan mit dem Live-Stand aktuell halten
   const fx = s.fixtures.find((x) => x.id === id);
