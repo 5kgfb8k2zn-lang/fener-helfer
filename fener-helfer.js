@@ -11,7 +11,7 @@
 
 const API = "https://v3.football.api-sports.io";
 const SEASON = 2026;
-const VERSION = 6;
+const VERSION = 7;
 const DAILY_LIMIT = 100;
 const CAP = 95; // 5 Anfragen bleiben als Reserve
 const FINISHED = ["FT", "AET", "PEN"];
@@ -103,11 +103,12 @@ async function save(env, s) {
   await ensureTable(env);
   await env.DB.prepare("INSERT OR REPLACE INTO store (k, v) VALUES (?, ?)").bind("state", JSON.stringify(s)).run();
 }
+function source(env) { return String(env.SOURCE || "thesportsdb").toLowerCase().indexOf("api") === 0 ? "apifootball" : "tsdb"; }
 function publicState(s, env) {
   return {
-    v: VERSION, now: Date.now(), syncedAt: s.syncedAt, fixtures: s.fixtures, table: s.table,
+    v: VERSION, now: Date.now(), source: source(env), syncedAt: s.syncedAt, fixtures: s.fixtures, table: s.table,
     live: s.live, lastLive: s.lastLive, lineups: s.lineups, usage: s.usage, lastPollAt: s.lastPollAt,
-    error: s.error, pushError: s.pushError || "", push: !!env.NTFY_TOPIC, apiKey: !!env.API_KEY,
+    error: s.error, pushError: s.pushError || "", push: !!env.NTFY_TOPIC, apiKey: source(env) === "tsdb" ? true : !!env.API_KEY,
     prefs: Object.assign({}, DEFAULT_PREFS, s.prefs || {}),
     rivals: (s.rivalFx || []).map((r) => ({ id: r.id, date: r.date, h: r.h, a: r.a, st: r.st, gh: r.gh, ga: r.ga })),
   };
@@ -320,6 +321,7 @@ async function tick(env) {
   const s = await load(env);
   setPrefs(s);
   const now = Date.now();
+  if (source(env) === "tsdb") return tickTsdb(env, s, now);
   let dirty = false;
   if (s.usage.day !== utcDay()) { s.usage = { day: utcDay(), n: 0 }; dirty = true; }
   if (!env.API_KEY) {
@@ -378,20 +380,7 @@ async function tick(env) {
     }
   }
 
-  // Erinnerung am Spieltag (ab 9 Uhr deutscher Zeit, bei frühem Anpfiff 3 Std. vorher) – kostet keine Anfrage
-  const todayFx = sorted(s).find((a) => STOP.indexOf(a.st) < 0 && berlinDay(kick(a)) === berlinDay(now) && kick(a) > now + 20 * 60000);
-  if (todayFx && !(s.reminded || {})[todayFx.id] && (berlinHour(now) >= 9 || now >= kick(todayFx) - 3 * 3600 * 1000)) {
-    s.reminded = { [todayFx.id]: true };
-    const fbHome = isFb(todayFx.h), opp = fbHome ? todayFx.a : todayFx.h;
-    const neutral = /final/i.test(todayFx.round || "") && todayFx.lg !== 203;
-    const c = outcome(FB_RATING, rating(opp, todayFx.lg), neutral ? 0 : fbHome ? 3 : -3, [0, 0], 1, 0, 0);
-    await push(env, {
-      cat: "reminder", title: "Heute spielt Fener! " + berlin(kick(todayFx), { hour: "2-digit", minute: "2-digit" }) + " Uhr",
-      message: todayFx.h + " – " + todayFx.a + " (" + (LEAGUE_NAMES[todayFx.lg] || "") + ")\nPrognose: Sieg " + pct(c.w) + " · Remis " + pct(c.d) + " · Niederlage " + pct(c.l) + "\nSchon getippt? Tippspiel in der Fener-App.",
-      tags: ["calendar", "soccer"], priority: 3,
-    });
-    dirty = true;
-  }
+  if (await maybeRemind(env, s, now)) dirty = true;
 
   // Rivalen-Alarm: Endergebnis von Galatasaray, Beşiktaş, Trabzonspor (nur wenn das Budget für Fener sicher reicht)
   if (!w && s.rivalFx && s.rivalFx.length && now - (s.rivalPollAt || 0) >= 10 * 60000) {
@@ -419,6 +408,25 @@ async function tick(env) {
   }
 
   if (dirty) await save(env, s);
+}
+
+async function maybeRemind(env, s, now) {
+  // Erinnerung am Spieltag (ab 9 Uhr deutscher Zeit, bei frühem Anpfiff 3 Std. vorher) – kostet keine Anfrage
+  const todayFx = sorted(s).find((a) => STOP.indexOf(a.st) < 0 && berlinDay(kick(a)) === berlinDay(now) && kick(a) > now + 20 * 60000);
+  if (todayFx && !(s.reminded || {})[todayFx.id] && (berlinHour(now) >= 9 || now >= kick(todayFx) - 3 * 3600 * 1000)) {
+    s.reminded = { [todayFx.id]: true };
+    const fbHome = isFb(todayFx.h), opp = fbHome ? todayFx.a : todayFx.h;
+    const neutral = /final/i.test(todayFx.round || "") && todayFx.lg !== 203;
+    const c = outcome(FB_RATING, rating(opp, todayFx.lg), neutral ? 0 : fbHome ? 3 : -3, [0, 0], 1, 0, 0);
+    await push(env, {
+      cat: "reminder", title: "Heute spielt Fener! " + berlin(kick(todayFx), { hour: "2-digit", minute: "2-digit" }) + " Uhr",
+      message: todayFx.h + " – " + todayFx.a + " (" + (LEAGUE_NAMES[todayFx.lg] || "") + ")\nPrognose: Sieg " + pct(c.w) + " · Remis " + pct(c.d) + " · Niederlage " + pct(c.l) + "\nSchon getippt? Tippspiel in der Fener-App.",
+      tags: ["calendar", "soccer"], priority: 3,
+    });
+    return true;
+  }
+  return false;
+
 }
 
 async function pushRival(env, s, r) {
@@ -590,5 +598,195 @@ async function handleUpdate(env, s, w, raw) {
   // Spielplan mit dem Live-Stand aktuell halten
   const fx = s.fixtures.find((x) => x.id === id);
   if (fx) { fx.st = st; fx.gh = f.goals.home; fx.ga = f.goals.away; fx.ph = f.score.penalty.home; fx.pa = f.score.penalty.away; }
+  s.live = f;
+}
+
+// ===========================================================================
+// Datenquelle TheSportsDB (kostenlos, für private Projekte erlaubt)
+// Kein Live-Ticker im Free-Plan: Spielstände kommen, sobald TheSportsDB sie einträgt.
+// Abgefragt wird während eines Fener-Spiels alle 5 Minuten, danach alle 15 Minuten bis zum Endergebnis.
+// ===========================================================================
+const TSDB = "https://www.thesportsdb.com/api/v1/json/";
+const TSDB_FENER = 133807;            // Fenerbahçe bei TheSportsDB (wird beim ersten Mal per Suche geprüft)
+const TSDB_LEAGUES = { 4339: 203, 4480: 2 };
+const TSDB_SEASON = "2026-2027";
+
+async function tsdbGet(env, s, path) {
+  if (s.usage.day !== utcDay()) s.usage = { day: utcDay(), n: 0 };
+  s.usage.n++;
+  const r = await fetch(TSDB + (env.TSDB_KEY || "123") + "/" + path);
+  if (r.status === 429) throw new Error("TheSportsDB: kurz zu viele Anfragen, es geht in einer Minute weiter.");
+  const t = await r.text();
+  try { return JSON.parse(t) || {}; } catch (e) { throw new Error("TheSportsDB antwortet unerwartet (" + r.status + "): " + t.slice(0, 80)); }
+}
+function n0(x) { return x === null || x === undefined || x === "" ? null : +x; }
+function tsLeague(e) {
+  if (TSDB_LEAGUES[+e.idLeague]) return TSDB_LEAGUES[+e.idLeague];
+  const l = norm(e.strLeague);
+  if (l.indexOf("champions") >= 0) return 2;
+  if (l.indexOf("cup") >= 0 || l.indexOf("kupa") >= 0) return 206;
+  if (l.indexOf("superlig") >= 0 || l.indexOf("turkish") >= 0) return 203;
+  return 0;
+}
+function tsDate(e) {
+  if (e.strTimestamp) { const t = String(e.strTimestamp).replace(" ", "T"); return /[zZ]|[+-]\d\d:?\d\d$/.test(t) ? t : t + "Z"; }
+  const tm = String(e.strTime || "18:00:00").slice(0, 8);
+  return (e.dateEvent || utcDay()) + "T" + tm + "Z";
+}
+function tsStatus(e, now) {
+  const st = String(e.strStatus || "").trim().toLowerCase();
+  const k = Date.parse(tsDate(e));
+  const hasScore = e.intHomeScore !== null && e.intHomeScore !== undefined && e.intHomeScore !== "";
+  if (/postpon|cancel|abandon|pst|canc/.test(st)) return "PST";
+  if (/finish|^ft$|^aet$|^pen|after/.test(st)) return /pen/.test(st) ? "PEN" : /aet|extra/.test(st) ? "AET" : "FT";
+  if (/^ht$|half ?time/.test(st)) return "HT";
+  if (/^1h$|first half/.test(st)) return "1H";
+  if (/^2h$|second half/.test(st)) return "2H";
+  if (/live|in play|^et$/.test(st)) return "2H";
+  if (hasScore && now > k + 110 * 60000) return "FT";
+  if (hasScore && now >= k) return now < k + 50 * 60000 ? "1H" : "2H";
+  return "NS";
+}
+function tsRound(e, lg) {
+  const r = e.intRound ? String(e.intRound) : "";
+  if (lg === 203 && r) return "Regular Season - " + r;
+  if (lg === 2 && r && +r <= 8) return "League Stage - " + r;
+  return e.strLeague || "";
+}
+function tsCompact(e, now) {
+  const lg = tsLeague(e);
+  return { id: +e.idEvent, date: tsDate(e), st: tsStatus(e, now), lg: lg, round: tsRound(e, lg), h: e.strHomeTeam, a: e.strAwayTeam, hid: +e.idHomeTeam, aid: +e.idAwayTeam, gh: n0(e.intHomeScore), ga: n0(e.intAwayScore), ph: null, pa: null };
+}
+function tsLive(c) {
+  return { fixture: { id: c.id, date: c.date, status: { short: c.st, elapsed: null } }, league: { id: c.lg, name: LEAGUE_NAMES[c.lg] || "", round: c.round }, teams: { home: { name: c.h }, away: { name: c.a } }, goals: { home: c.gh, away: c.ga }, score: { penalty: { home: null, away: null } }, events: [], source: "tsdb" };
+}
+function upsert(list, c) {
+  const i = list.findIndex((x) => x.id === c.id);
+  if (i < 0) list.push(c); else list[i] = Object.assign(list[i], c);
+}
+async function tsdbTeamId(env, s, name, fallback) {
+  try {
+    const j = await tsdbGet(env, s, "searchteams.php?t=" + encodeURIComponent(name));
+    const t = (j.teams || []).find((x) => /soccer/i.test(x.strSport || "soccer") && !/women|kadın/i.test(x.strTeam || ""));
+    if (t) return +t.idTeam;
+  } catch (e) { /* Rückfall unten */ }
+  return fallback || null;
+}
+
+async function syncTsdb(env, s, now) {
+  const T = s.tsdb || (s.tsdb = {});
+  if (!T.teamId) T.teamId = TSDB_FENER;
+  const nx = await tsdbGet(env, s, "eventsnext.php?id=" + T.teamId);
+  const ls = await tsdbGet(env, s, "eventslast.php?id=" + T.teamId);
+  (nx.events || []).concat(ls.results || []).forEach((e) => upsert(s.fixtures, tsCompact(e, now)));
+  // Tabelle der Süper Lig
+  try {
+    const tb = await tsdbGet(env, s, "lookuptable.php?l=4339&s=" + TSDB_SEASON);
+    const rows = tb.table || [];
+    if (rows.length) s.table = rows.map((t) => ({ n: t.strTeam, p: +t.intPlayed, pts: +t.intPoints, gf: +t.intGoalsFor, ga: +t.intGoalsAgainst, id: +t.idTeam }));
+    T.tableRows = rows.length;
+  } catch (e) { T.tableErr = String(e.message || e); }
+  // Rivalen: ihre nächsten Ligaspiele
+  if (!T.rivals) {
+    T.rivals = {};
+    const search = { "Galatasaray": "Galatasaray", "Beşiktaş": "Besiktas", "Trabzonspor": "Trabzonspor" };
+    for (const r of RIVALS) { const id = await tsdbTeamId(env, s, search[r[1]], null); if (id) T.rivals[id] = r[1]; }
+  }
+  s.rivalIds = T.rivals;
+  for (const id of Object.keys(T.rivals)) {
+    try {
+      const j = await tsdbGet(env, s, "eventsnext.php?id=" + id);
+      (j.events || []).forEach((e) => {
+        const c = tsCompact(e, now);
+        if (c.lg !== 203 || isFb(c.h) || isFb(c.a)) return;
+        if (!s.rivalFx.some((x) => x.id === c.id)) s.rivalFx.push(Object.assign(c, { done: FINISHED.indexOf(c.st) >= 0 }));
+      });
+    } catch (e) { /* nächster Rivale */ }
+  }
+  T.fixtures = s.fixtures.length;
+  s.syncedAt = now; s.syncFailAt = 0;
+}
+
+async function tickTsdb(env, s, now) {
+  let dirty = false;
+  if (s.source !== "tsdb") {
+    // Umstieg von API-Football: alte Daten verwerfen
+    Object.assign(s, { source: "tsdb", fixtures: [], table: [], rivalFx: [], rivalIds: {}, notified: {}, live: null, lastLive: null, syncedAt: 0, syncFailAt: 0, error: "", tsdb: {}, chanceLog: null });
+    dirty = true;
+  }
+  if (s.usage.day !== utcDay()) { s.usage = { day: utcDay(), n: 0 }; dirty = true; }
+  const needs = !s.syncedAt || now - s.syncedAt > 6 * 3600 * 1000 || s.fixtures.some((a) => { const e = kick(a) + 115 * 60000; return e > s.syncedAt && e < now && FINISHED.indexOf(a.st) < 0; });
+  if (needs && !(s.syncFailAt && now - s.syncFailAt < 20 * 60000) && !(s.syncedAt && now - s.syncedAt < 15 * 60000)) {
+    try { await syncTsdb(env, s, now); s.error = ""; } catch (e) { s.error = String(e.message || e); s.syncFailAt = now; }
+    dirty = true;
+  }
+
+  // Fener-Spiel: von Anpfiff bis Endergebnis beobachten
+  const w = sorted(s).find((a) => STOP.indexOf(a.st) < 0 && now >= kick(a) - 5 * 60000 && now <= kick(a) + 8 * 3600 * 1000);
+  if (w) {
+    const iv = now < kick(w) + 130 * 60000 ? 5 * 60000 : 15 * 60000;
+    if (now - (s.lastPollAt || 0) >= iv - 5000) {
+      s.lastPollAt = now;
+      try {
+        const j = await tsdbGet(env, s, "lookupevent.php?id=" + w.id);
+        const e = (j.events || [])[0];
+        if (e) await handleTsdb(env, s, w, tsCompact(e, now));
+        s.error = "";
+      } catch (e) { s.error = String(e.message || e); }
+      dirty = true;
+    }
+  }
+
+  if (await maybeRemind(env, s, now)) dirty = true;
+
+  // Rivalen: Endergebnis nachsehen (alle 20 Minuten nach Spielende, bis zu 12 Stunden)
+  if (s.rivalFx && s.rivalFx.length && now - (s.rivalPollAt || 0) >= 20 * 60000) {
+    const due = s.rivalFx.filter((r) => !r.done && now >= kick(r) + 110 * 60000 && now <= kick(r) + 12 * 3600 * 1000).slice(0, 3);
+    if (due.length) {
+      s.rivalPollAt = now;
+      for (const r of due) {
+        try {
+          const j = await tsdbGet(env, s, "lookupevent.php?id=" + r.id);
+          const e = (j.events || [])[0]; if (!e) continue;
+          const c = tsCompact(e, now);
+          Object.assign(r, { st: c.st, gh: c.gh, ga: c.ga });
+          if (c.st === "PST") r.done = true;
+          else if (FINISHED.indexOf(c.st) >= 0 && c.gh !== null) { r.done = true; await pushRival(env, s, r); }
+        } catch (e) { /* später nochmal */ }
+      }
+      dirty = true;
+    }
+    const before = s.rivalFx.length;
+    s.rivalFx = s.rivalFx.filter((r) => now - kick(r) < 36 * 3600 * 1000);
+    if (s.rivalFx.length !== before) dirty = true;
+  }
+  if (dirty) await save(env, s);
+}
+
+// Neue Spielstände aus TheSportsDB melden
+async function handleTsdb(env, s, w, c) {
+  const id = c.id;
+  if (!s.notified[id]) s.notified = { [id]: { ko: false, ht: false, ft: false, gh: 0, ga: 0 } };
+  const N = s.notified[id];
+  const comp = LEAGUE_NAMES[c.lg] || "";
+  const gh = c.gh || 0, ga = c.ga || 0, fbHome = isFb(c.h);
+  const line = c.h + " " + gh + ":" + ga + " " + c.a;
+  const f = tsLive(c);
+  const mins = (Date.now() - kick(c)) / 60000;
+  f.fixture.status.elapsed = c.st === "HT" ? 45 : Math.max(0, Math.min(90, Math.round(mins > 60 ? mins - 15 : Math.min(45, mins))));
+  if (!N.ko && PLAYING.indexOf(c.st) >= 0) { N.ko = true; await push(env, { cat: "kickoff", title: "Anpfiff · " + comp, message: c.h + " – " + c.a + " läuft! Spielstände kommen von TheSportsDB und können ein paar Minuten verzögert sein.", tags: ["stopwatch"], priority: 3 }); }
+  if (FINISHED.indexOf(c.st) < 0 && gh + ga > N.gh + N.ga) {
+    const fbScored = fbHome ? gh > N.gh : ga > N.ga;
+    await push(env, { cat: fbScored ? "goals" : "oppgoals", title: fbScored ? "⚽ TOR für Fenerbahçe!" : "Gegentor", message: line + chanceLine(f) + "\n(Stand laut TheSportsDB, evtl. verzögert)", tags: ["soccer"], priority: fbScored ? 5 : 4 });
+  }
+  N.gh = gh; N.ga = ga;
+  if (!N.ht && c.st === "HT") { N.ht = true; await push(env, { cat: "ht", title: "Halbzeit", message: line + chanceLine(f), tags: ["pause_button"], priority: 2 }); }
+  if (!N.ft && FINISHED.indexOf(c.st) >= 0 && c.gh !== null) {
+    N.ft = true;
+    const fg = fbHome ? gh : ga, og = fbHome ? ga : gh;
+    await push(env, { cat: "ft", title: "Endergebnis · " + comp, message: line + "\n" + (fg > og ? "Sieg! 💛💙" : fg < og ? "Niederlage." : "Unentschieden."), tags: ["checkered_flag"], priority: 4 });
+    s.lastLive = f;
+  }
+  upsert(s.fixtures, c);
   s.live = f;
 }
