@@ -11,7 +11,7 @@
 
 const API = "https://v3.football.api-sports.io";
 const SEASON = 2026;
-const VERSION = 1;
+const VERSION = 2;
 const DAILY_LIMIT = 100;
 const CAP = 95; // 5 Anfragen bleiben als Reserve
 const FINISHED = ["FT", "AET", "PEN"];
@@ -46,8 +46,10 @@ export default {
         s.testAt = Date.now();
         await save(env, s);
         if (!env.NTFY_TOPIC) return new Response(JSON.stringify({ ok: false, error: "NTFY_TOPIC fehlt in den Einstellungen des Workers." }), { headers });
-        await push(env, { title: "Fener-Helfer", message: "Test erfolgreich! Ab jetzt bekommst du hier die Tore von Fenerbahçe.", tags: ["white_check_mark"], priority: 3 });
-        return new Response(JSON.stringify({ ok: true }), { headers });
+        const r = await push(env, { title: "Fener-Helfer", message: "Test erfolgreich! Ab jetzt bekommst du hier die Tore von Fenerbahçe.", tags: ["white_check_mark"], priority: 3 });
+        s.pushError = r.ok ? "" : r.error; await save(env, s);
+        const topic = env.NTFY_TOPIC.trim();
+        return new Response(JSON.stringify(r.ok ? { ok: true, topic: topic } : { ok: false, topic: topic, error: r.error + " (Kanal: " + topic + ")" }), { headers });
       }
       if (url.pathname === "/" || url.pathname === "") {
         const s = await load(env);
@@ -71,7 +73,7 @@ async function ensureTable(env) {
   tableReady = true;
 }
 function emptyState() {
-  return { v: VERSION, teamId: null, fixtures: [], table: [], syncedAt: 0, syncFailAt: 0, live: null, lastLive: null, lineups: {}, lineupTry: {}, notified: {}, usage: { day: "", n: 0 }, lastPollAt: 0, error: "", testAt: 0 };
+  return { v: VERSION, teamId: null, fixtures: [], table: [], syncedAt: 0, syncFailAt: 0, live: null, lastLive: null, lineups: {}, lineupTry: {}, notified: {}, usage: { day: "", n: 0 }, lastPollAt: 0, error: "", testAt: 0, pushError: "" };
 }
 async function load(env) {
   await ensureTable(env);
@@ -87,7 +89,7 @@ function publicState(s, env) {
   return {
     v: VERSION, now: Date.now(), syncedAt: s.syncedAt, fixtures: s.fixtures, table: s.table,
     live: s.live, lastLive: s.lastLive, lineups: s.lineups, usage: s.usage, lastPollAt: s.lastPollAt,
-    error: s.error, push: !!env.NTFY_TOPIC, apiKey: !!env.API_KEY,
+    error: s.error, pushError: s.pushError || "", push: !!env.NTFY_TOPIC, apiKey: !!env.API_KEY,
   };
 }
 
@@ -124,11 +126,11 @@ code{display:block;word-break:break-all;background:var(--bg);border:1px solid va
 <h1>Fener-<span>Helfer</span></h1>
 <p>Läuft jede Minute bei Cloudflare und meldet dir die Fener-Spiele per Push, auch wenn die App zu ist.</p>
 <section class="card"><div class="label">Status</div><ul>${checks}</ul><small>Nächstes Spiel: ${next} · heute ${s.usage && s.usage.day === utcDay() ? s.usage.n : 0} von ${DAILY_LIMIT} Anfragen</small>${s.error ? `<small style="color:var(--no)">Problem: ${esc(s.error)}</small>` : ""}</section>
-<section class="card"><div class="label">1 · Push-Nachrichten</div><p>ntfy aus dem App Store installieren, dann hier tippen:</p>${topic}<button class="ghost" id="test">Test-Nachricht senden</button><p id="msg"></p></section>
+<section class="card"><div class="label">1 · Push-Nachrichten</div><p>ntfy aus dem App Store installieren, dann hier tippen:</p>${topic}${env.NTFY_TOPIC ? `<small>Kanal: <b>${esc(env.NTFY_TOPIC.trim())}</b> – genau dieser Name muss in der ntfy-App stehen.</small>` : ""}${s.pushError ? `<small style="color:var(--no)">Letzter Fehler beim Senden: ${esc(s.pushError)}</small>` : ""}<button class="ghost" id="test">Test-Nachricht senden</button><p id="msg"></p></section>
 <section class="card"><div class="label">2 · Mit der Fener-App verbinden</div><p>Adresse kopieren und in der Fener-App unter Live → Hintergrund-Helfer einfügen.</p><code id="u">${esc(origin)}</code><button id="copy">Adresse kopieren</button></section>
 <script>
 document.getElementById("copy").onclick=function(){var t=document.getElementById("u").textContent,b=this;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){b.textContent="Kopiert ✓"},function(){var r=document.createRange();r.selectNode(document.getElementById("u"));getSelection().removeAllRanges();getSelection().addRange(r);b.textContent="Markiert – jetzt Kopieren antippen"})};
-document.getElementById("test").onclick=function(){var m=document.getElementById("msg");m.textContent="Sende …";fetch("/test").then(function(r){return r.json()}).then(function(j){m.textContent=j.ok?"Gesendet! Schau in die ntfy-App.":(j.error||"Hat nicht geklappt.")},function(){m.textContent="Hat nicht geklappt."})};
+document.getElementById("test").onclick=function(){var m=document.getElementById("msg");m.textContent="Sende …";fetch("/test").then(function(r){return r.json()}).then(function(j){m.textContent=j.ok?"Gesendet an Kanal „"+j.topic+"“. Schau in die ntfy-App.":(j.error||"Hat nicht geklappt.")},function(){m.textContent="Hat nicht geklappt."})};
 </script></main></body></html>`;
 }
 
@@ -160,13 +162,33 @@ async function api(env, s, path) {
   return j.response || [];
 }
 
+// Schickt eine Nachricht an ntfy. Gibt { ok, error } zurück.
+// Optional: NTFY_TOKEN (Zugangs-Token eines kostenlosen ntfy-Kontos), falls ntfy Anfragen von Cloudflare drosselt.
 async function push(env, msg) {
-  if (!env.NTFY_TOPIC) return;
-  const body = { topic: env.NTFY_TOPIC, title: msg.title, message: msg.message, tags: msg.tags || [], priority: msg.priority || 3 };
+  if (!env.NTFY_TOPIC) return { ok: false, error: "NTFY_TOPIC fehlt" };
+  const server = (env.NTFY_SERVER || "https://ntfy.sh").replace(/\/+$/, "");
+  const auth = env.NTFY_TOKEN ? { Authorization: "Bearer " + env.NTFY_TOKEN } : {};
+  const body = { topic: env.NTFY_TOPIC.trim(), title: msg.title, message: msg.message, tags: msg.tags || [], priority: msg.priority || 3 };
   if (env.APP_URL) body.click = env.APP_URL;
+  let first = "";
   try {
-    await fetch(env.NTFY_SERVER || "https://ntfy.sh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  } catch (e) { console.log("Push fehlgeschlagen:", e); }
+    const r = await fetch(server + "/", { method: "POST", headers: { "Content-Type": "application/json", ...auth }, body: JSON.stringify(body) });
+    if (r.ok) return { ok: true };
+    first = r.status + " " + (await r.text()).slice(0, 200);
+  } catch (e) { first = String((e && e.message) || e); }
+  // Zweiter Weg: einfache Nachricht an /<kanal>, Titel als Parameter
+  try {
+    const q = new URLSearchParams({ title: msg.title, tags: (msg.tags || []).join(","), priority: String(msg.priority || 3) });
+    if (env.APP_URL) q.set("click", env.APP_URL);
+    const r2 = await fetch(server + "/" + encodeURIComponent(env.NTFY_TOPIC.trim()) + "?" + q.toString(), { method: "POST", headers: { "Content-Type": "text/plain; charset=utf-8", ...auth }, body: msg.message });
+    if (r2.ok) return { ok: true };
+    const second = r2.status + " " + (await r2.text()).slice(0, 200);
+    console.log("Push fehlgeschlagen:", first, "|", second);
+    return { ok: false, error: "ntfy antwortet: " + second };
+  } catch (e) {
+    console.log("Push fehlgeschlagen:", first, e);
+    return { ok: false, error: "ntfy nicht erreichbar: " + String((e && e.message) || e) };
+  }
 }
 
 // ---------------------------------------------------------------------------
