@@ -208,7 +208,7 @@ function pois(k, l) { let p = Math.exp(-l); for (let i = 1; i <= k; i++) p *= l 
 // Wahrscheinlichkeit für Sieg/Remis/Niederlage aus Fener-Sicht.
 // cur = [Fener-Tore, Gegner-Tore] bisher, rest = Anteil der Spielzeit, der noch fehlt (0..1)
 function outcome(fbR, opR, adv, cur, rest, fbReds, opReds) {
-  const d = (fbR - opR + adv) / 25;
+  const d = (fbR - opR + adv) / 22.5;
   let lf = 1.35 * Math.exp(d) * rest, lo = 1.35 * Math.exp(-d) * rest;
   lf *= Math.pow(0.8, fbReds || 0) * Math.pow(1.15, opReds || 0);
   lo *= Math.pow(0.8, opReds || 0) * Math.pow(1.15, fbReds || 0);
