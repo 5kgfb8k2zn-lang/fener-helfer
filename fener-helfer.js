@@ -11,7 +11,7 @@
 
 const API = "https://v3.football.api-sports.io";
 const SEASON = 2026;
-const VERSION = 5;
+const VERSION = 6;
 const DAILY_LIMIT = 100;
 const CAP = 95; // 5 Anfragen bleiben als Reserve
 const FINISHED = ["FT", "AET", "PEN"];
@@ -171,7 +171,8 @@ async function api(env, s, path) {
   if (s.usage.day !== utcDay()) s.usage = { day: utcDay(), n: 0 };
   if (s.usage.n >= CAP) throw new Error("Tageslimit erreicht (" + s.usage.n + " von " + DAILY_LIMIT + ").");
   s.usage.n++;
-  const r = await fetch(API + path, { headers: { "x-apisports-key": env.API_KEY } });
+  const key = String(env.API_KEY).trim().replace(/^["']|["']$/g, "");
+  const r = await fetch(API + path, { headers: { "x-apisports-key": key } });
   const rem = r.headers.get("x-ratelimit-requests-remaining");
   if (rem !== null && !isNaN(+rem)) s.usage.n = Math.max(s.usage.n, DAILY_LIMIT - +rem);
   const j = await r.json();
@@ -325,6 +326,9 @@ async function tick(env) {
     if (s.error !== "API_KEY fehlt") { s.error = "API_KEY fehlt"; await save(env, s); }
     return;
   }
+  // Neuer Schlüssel eingetragen? Dann sofort neu versuchen statt 30 Minuten zu warten
+  const fp = String(env.API_KEY).trim().slice(-4) + ":" + String(env.API_KEY).trim().length;
+  if (s.keyFp !== fp) { s.keyFp = fp; s.syncFailAt = 0; s.error = ""; dirty = true; }
 
   if (needSync(s, now)) {
     try { await sync(env, s); s.error = ""; } catch (e) { s.error = String(e.message || e); s.syncFailAt = now; }
