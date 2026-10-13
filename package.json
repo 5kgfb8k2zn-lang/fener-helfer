@@ -1,0 +1,19 @@
+{
+  "name": "fener-helfer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Push-Nachrichten für Fenerbahçe-Spiele (Hintergrund-Helfer der Fener-Simulator-App)",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "API_KEY": { "description": "Dein Schlüssel von api-football.com (Dashboard → Account)." },
+      "NTFY_TOPIC": { "description": "Kanalname für die Push-Nachrichten. Genau diesen Namen in der ntfy-App abonnieren." },
+      "DB": { "description": "Kleine Datenbank, in der sich der Helfer den Spielstand merkt. Wird automatisch angelegt." }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# Fener-Helfer: Cloudflare Worker, läuft jede Minute
+name = "fener-helfer"
+main = "fener-helfer.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+APP_URL = "https://5kgfb8k2zn-lang.github.io/Fener-Simulator-/"
+
+# Die Datenbank wird beim ersten Deploy automatisch angelegt
+[[d1_databases]]
+binding = "DB"
+database_name = "fener"
