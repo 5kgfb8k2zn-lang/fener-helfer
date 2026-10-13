@@ -11,7 +11,7 @@
 
 const API = "https://v3.football.api-sports.io";
 const SEASON = 2026;
-const VERSION = 2;
+const VERSION = 3;
 const DAILY_LIMIT = 100;
 const CAP = 95; // 5 Anfragen bleiben als Reserve
 const FINISHED = ["FT", "AET", "PEN"];
@@ -73,7 +73,7 @@ async function ensureTable(env) {
   tableReady = true;
 }
 function emptyState() {
-  return { v: VERSION, teamId: null, fixtures: [], table: [], syncedAt: 0, syncFailAt: 0, live: null, lastLive: null, lineups: {}, lineupTry: {}, notified: {}, usage: { day: "", n: 0 }, lastPollAt: 0, error: "", testAt: 0, pushError: "" };
+  return { v: VERSION, teamId: null, fixtures: [], table: [], syncedAt: 0, syncFailAt: 0, live: null, lastLive: null, lineups: {}, lineupTry: {}, notified: {}, usage: { day: "", n: 0 }, lastPollAt: 0, error: "", testAt: 0, pushError: "", rivalIds: {}, rivalFx: [], rivalPollAt: 0, reminded: {} };
 }
 async function load(env) {
   await ensureTable(env);
@@ -90,6 +90,7 @@ function publicState(s, env) {
     v: VERSION, now: Date.now(), syncedAt: s.syncedAt, fixtures: s.fixtures, table: s.table,
     live: s.live, lastLive: s.lastLive, lineups: s.lineups, usage: s.usage, lastPollAt: s.lastPollAt,
     error: s.error, pushError: s.pushError || "", push: !!env.NTFY_TOPIC, apiKey: !!env.API_KEY,
+    rivals: (s.rivalFx || []).map((r) => ({ id: r.id, date: r.date, h: r.h, a: r.a, st: r.st, gh: r.gh, ga: r.ga })),
   };
 }
 
@@ -192,6 +193,59 @@ async function push(env, msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Prognose: Stärkewerte (wie in der App) und Poisson-Modell
+// ---------------------------------------------------------------------------
+const FB_RATING = 84;
+const RATINGS = [["galatasaray", 84], ["besiktas", 80], ["trabzon", 79], ["basaksehir", 75], ["amed", 74], ["samsun", 73], ["alanya", 72], ["goztepe", 72], ["kocaeli", 71], ["rize", 71], ["kasimpasa", 70], ["konya", 70], ["gaziantep", 70], ["corum", 69], ["gencler", 68], ["erzurum", 68], ["eyup", 67],
+  ["liverpool", 89], ["atletico", 86], ["astonvilla", 83], ["roma", 82], ["villarreal", 82], ["shakhtar", 77], ["slavia", 76], ["lask", 72], ["realmadrid", 91], ["bayern", 90], ["barcelona", 89], ["arsenal", 89], ["manchestercity", 89], ["mancity", 89], ["parissaint", 89], ["psg", 89], ["inter", 87], ["chelsea", 86], ["napoli", 85], ["leverkusen", 84], ["dortmund", 84], ["juventus", 84], ["benfica", 82], ["sporting", 82], ["porto", 81], ["psv", 81], ["marseille", 81], ["brugge", 79]];
+const RIVALS = [["galatasaray", "Galatasaray"], ["besiktas", "Beşiktaş"], ["trabzon", "Trabzonspor"]];
+function rating(name, league) {
+  if (isFb(name)) return FB_RATING;
+  const k = norm(name);
+  const r = RATINGS.find((x) => k.indexOf(x[0]) >= 0);
+  return r ? r[1] : league === 203 ? 70 : 78;
+}
+function pois(k, l) { let p = Math.exp(-l); for (let i = 1; i <= k; i++) p *= l / i; return p; }
+// Wahrscheinlichkeit für Sieg/Remis/Niederlage aus Fener-Sicht.
+// cur = [Fener-Tore, Gegner-Tore] bisher, rest = Anteil der Spielzeit, der noch fehlt (0..1)
+function outcome(fbR, opR, adv, cur, rest, fbReds, opReds) {
+  const d = (fbR - opR + adv) / 25;
+  let lf = 1.35 * Math.exp(d) * rest, lo = 1.35 * Math.exp(-d) * rest;
+  lf *= Math.pow(0.8, fbReds || 0) * Math.pow(1.15, opReds || 0);
+  lo *= Math.pow(0.8, opReds || 0) * Math.pow(1.15, fbReds || 0);
+  let w = 0, dr = 0, l = 0;
+  for (let i = 0; i <= 10; i++) for (let j = 0; j <= 10; j++) {
+    const p = pois(i, lf) * pois(j, lo), f = cur[0] + i, o = cur[1] + j;
+    if (f > o) w += p; else if (f === o) dr += p; else l += p;
+  }
+  const t = w + dr + l || 1;
+  return { w: w / t, d: dr / t, l: l / t };
+}
+function pct(x) { return Math.round(x * 100) + " %"; }
+function berlin(ts, opt) { return new Date(ts).toLocaleString("de-DE", Object.assign({ timeZone: "Europe/Berlin" }, opt)); }
+function berlinDay(ts) { return new Date(ts).toLocaleDateString("en-CA", { timeZone: "Europe/Berlin" }); }
+function berlinHour(ts) { return +new Date(ts).toLocaleString("en-GB", { timeZone: "Europe/Berlin", hour: "2-digit", hour12: false }); }
+
+// Live-Siegchance aus dem aktuellen Spielstand
+function liveChance(f) {
+  const fbHome = isFb(f.teams.home.name);
+  const st = f.fixture.status.short, el = f.fixture.status.elapsed || 0;
+  if (["ET", "BT", "P"].indexOf(st) >= 0 || FINISHED.indexOf(st) >= 0) return null;
+  const rest = st === "HT" ? 0.5 : Math.max(0.02, (90 - Math.min(el, 90)) / 90);
+  const opName = fbHome ? f.teams.away.name : f.teams.home.name;
+  const gh = f.goals.home || 0, ga = f.goals.away || 0;
+  let fbReds = 0, opReds = 0;
+  (f.events || []).forEach((e) => { if (e.type === "Card" && /Red|Second/.test(e.detail)) { if (isFb(e.team.name)) fbReds++; else opReds++; } });
+  const neutral = /final/i.test(f.league.round || "") && f.league.id !== 203;
+  return outcome(FB_RATING, rating(opName, f.league.id), neutral ? 0 : fbHome ? 3 : -3, fbHome ? [gh, ga] : [ga, gh], rest, fbReds, opReds);
+}
+function chanceLine(f) {
+  const c = liveChance(f);
+  if (!c) return "";
+  return "\nSiegchance jetzt " + pct(c.w) + " · Remis " + pct(c.d);
+}
+
+// ---------------------------------------------------------------------------
 // Abgleich: Spielplan + Tabelle (2 Anfragen, beim ersten Mal 3)
 // ---------------------------------------------------------------------------
 function needSync(s, now) {
@@ -217,6 +271,22 @@ async function sync(env, s) {
   }));
   const rows = (st[0] && st[0].league && st[0].league.standings && st[0].league.standings[0]) || [];
   s.table = rows.map((t) => ({ n: t.team.name, p: t.all.played, pts: t.points, gf: t.all.goals.for, ga: t.all.goals.against }));
+  s.rivalIds = {};
+  rows.forEach((t) => { const r = RIVALS.find((x) => norm(t.team.name).indexOf(x[0]) >= 0); if (r) s.rivalIds[t.team.id] = r[1]; });
+  if (Object.keys(s.rivalIds).length) {
+    try {
+      const from = utcDay(), to = new Date(Date.now() + 8 * 86400000).toISOString().slice(0, 10);
+      const lf = await api(env, s, "/fixtures?league=203&season=" + SEASON + "&from=" + from + "&to=" + to);
+      const keep = (s.rivalFx || []).filter((r) => !r.done && Date.now() - Date.parse(r.date) < 8 * 3600 * 1000);
+      lf.forEach((f) => {
+        const hid = f.teams.home.id, aid = f.teams.away.id;
+        if (!(s.rivalIds[hid] || s.rivalIds[aid]) || isFb(f.teams.home.name) || isFb(f.teams.away.name)) return;
+        if (keep.some((k) => k.id === f.fixture.id)) return;
+        keep.push({ id: f.fixture.id, date: f.fixture.date, h: f.teams.home.name, a: f.teams.away.name, hid: hid, aid: aid, st: f.fixture.status.short, gh: f.goals.home, ga: f.goals.away, done: FINISHED.indexOf(f.fixture.status.short) >= 0 });
+      });
+      s.rivalFx = keep;
+    } catch (e) { console.log("Rivalen-Spiele nicht geladen:", e); }
+  }
   s.syncedAt = Date.now();
   s.syncFailAt = 0;
 }
@@ -272,7 +342,67 @@ async function tick(env) {
     }
   }
 
+  // Erinnerung am Spieltag (ab 9 Uhr deutscher Zeit, bei frühem Anpfiff 3 Std. vorher) – kostet keine Anfrage
+  const todayFx = sorted(s).find((a) => STOP.indexOf(a.st) < 0 && berlinDay(kick(a)) === berlinDay(now) && kick(a) > now + 20 * 60000);
+  if (todayFx && !(s.reminded || {})[todayFx.id] && (berlinHour(now) >= 9 || now >= kick(todayFx) - 3 * 3600 * 1000)) {
+    s.reminded = { [todayFx.id]: true };
+    const fbHome = isFb(todayFx.h), opp = fbHome ? todayFx.a : todayFx.h;
+    const neutral = /final/i.test(todayFx.round || "") && todayFx.lg !== 203;
+    const c = outcome(FB_RATING, rating(opp, todayFx.lg), neutral ? 0 : fbHome ? 3 : -3, [0, 0], 1, 0, 0);
+    await push(env, {
+      title: "Heute spielt Fener! " + berlin(kick(todayFx), { hour: "2-digit", minute: "2-digit" }) + " Uhr",
+      message: todayFx.h + " – " + todayFx.a + " (" + (LEAGUE_NAMES[todayFx.lg] || "") + ")\nPrognose: Sieg " + pct(c.w) + " · Remis " + pct(c.d) + " · Niederlage " + pct(c.l) + "\nSchon getippt? Tippspiel in der Fener-App.",
+      tags: ["calendar", "soccer"], priority: 3,
+    });
+    dirty = true;
+  }
+
+  // Rivalen-Alarm: Endergebnis von Galatasaray, Beşiktaş, Trabzonspor (nur wenn das Budget für Fener sicher reicht)
+  if (!w && s.rivalFx && s.rivalFx.length && now - (s.rivalPollAt || 0) >= 10 * 60000) {
+    const due = s.rivalFx.filter((r) => !r.done && now >= kick(r) + 112 * 60000 && now <= kick(r) + 6 * 3600 * 1000);
+    const fenerLater = s.fixtures.some((a) => STOP.indexOf(a.st) < 0 && kick(a) > now && berlinDay(kick(a)) === berlinDay(now));
+    const budgetOk = s.usage.n < (fenerLater ? CAP - 90 : CAP - 8);
+    if (due.length && budgetOk) {
+      s.rivalPollAt = now;
+      try {
+        const res = await api(env, s, "/fixtures?ids=" + due.slice(0, 20).map((r) => r.id).join("-"));
+        for (const f of res) {
+          const r = s.rivalFx.find((x) => x.id === f.fixture.id);
+          if (!r) continue;
+          r.st = f.fixture.status.short; r.gh = f.goals.home; r.ga = f.goals.away;
+          if (["PST", "CANC", "ABD", "AWD", "WO"].indexOf(r.st) >= 0) { r.done = true; continue; }
+          if (FINISHED.indexOf(r.st) >= 0) { r.done = true; await pushRival(env, s, r); }
+        }
+      } catch (e) { s.error = String(e.message || e); }
+      dirty = true;
+    }
+    // Zu alte Einträge aufräumen
+    const before = s.rivalFx.length;
+    s.rivalFx = s.rivalFx.filter((r) => !(r.done && now - kick(r) > 24 * 3600 * 1000) && now - kick(r) < 8 * 3600 * 1000 + 24 * 3600 * 1000);
+    if (s.rivalFx.length !== before) dirty = true;
+  }
+
   if (dirty) await save(env, s);
+}
+
+async function pushRival(env, s, r) {
+  const isH = !!s.rivalIds[r.hid];
+  const name = s.rivalIds[isH ? r.hid : r.aid];
+  const opp = isH ? r.a : r.h;
+  const my = isH ? r.gh : r.ga, their = isH ? r.ga : r.gh;
+  const res = my > their ? "w" : my === their ? "d" : "l";
+  const title = res === "l" ? "😄 " + name + " verliert!" : res === "d" ? name + " nur Remis" : name + " gewinnt";
+  let msg = r.h + " " + r.gh + ":" + r.ga + " " + r.a;
+  // Abstand zu Fener nach dieser Partie (aus dem letzten Tabellenstand)
+  const row = (t) => s.table.find((x) => (t === "fb" ? isFb(x.n) : norm(x.n).indexOf(RIVALS.find((y) => y[1] === name)[0]) >= 0));
+  const fbRow = row("fb"), rvRow = row("rv");
+  if (fbRow && rvRow) {
+    const already = s.syncedAt > kick(r) + 120 * 60000;
+    const rvPts = rvRow.pts + (already ? 0 : res === "w" ? 3 : res === "d" ? 1 : 0);
+    const gap = fbRow.pts - rvPts;
+    msg += "\n" + (gap > 0 ? "Fener " + gap + (gap === 1 ? " Punkt" : " Punkte") + " vor " + name : gap < 0 ? "Fener " + -gap + (gap === -1 ? " Punkt" : " Punkte") + " hinter " + name : "Fener und " + name + " punktgleich") + " (Fener hat " + fbRow.p + ", " + name + " " + (rvRow.p + (already ? 0 : 1)) + " Spiele).";
+  }
+  await push(env, { title: title, message: msg, tags: res === "l" ? ["tada"] : res === "d" ? ["neutral_face"] : ["pensive"], priority: res === "w" ? 2 : 3 });
 }
 
 // Das Tagesbudget gleichmäßig auf die restliche Spielzeit verteilen (ca. alle 60–80 Sekunden)
@@ -348,12 +478,12 @@ async function handleUpdate(env, s, w, raw) {
       const how = e.detail === "Penalty" ? " (Elfmeter)" : e.detail === "Own Goal" ? " (Eigentor)" : "";
       const as = e.assist && e.assist.name ? ", Vorlage " + e.assist.name : "";
       await push(env, fb
-        ? { title: "⚽ TOR für Fenerbahçe!", message: e.player.name + how + " " + minute(e) + as + "\n" + line, tags: ["soccer", "yellow_heart", "blue_heart"], priority: 5 }
-        : { title: "Gegentor · " + e.team.name, message: e.player.name + how + " " + minute(e) + "\n" + line, tags: ["soccer"], priority: 4 });
+        ? { title: "⚽ TOR für Fenerbahçe!", message: e.player.name + how + " " + minute(e) + as + "\n" + line + chanceLine(f), tags: ["soccer", "yellow_heart", "blue_heart"], priority: 5 }
+        : { title: "Gegentor · " + e.team.name, message: e.player.name + how + " " + minute(e) + "\n" + line + chanceLine(f), tags: ["soccer"], priority: 4 });
     } else if (e.type === "Goal" && e.detail === "Missed Penalty") {
       await push(env, { title: "Elfmeter verschossen", message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line, tags: ["x"], priority: 3 });
     } else if (e.type === "Card" && /Red|Second/.test(e.detail)) {
-      await push(env, { title: "🟥 Rote Karte" + (fb ? " für Fener" : ""), message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line, tags: ["red_circle"], priority: 4 });
+      await push(env, { title: "🟥 Rote Karte" + (fb ? " für Fener" : ""), message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line + chanceLine(f), tags: ["red_circle"], priority: 4 });
     } else if (e.type === "Var" && /cancel|disallow/i.test(e.detail || "")) {
       await push(env, { title: "Videobeweis: Tor zurückgenommen", message: (e.player.name ? e.player.name + " " : "") + minute(e) + "\n" + line, tags: ["tv"], priority: 4 });
     }
@@ -361,13 +491,13 @@ async function handleUpdate(env, s, w, raw) {
   // Falls ein Tor ohne Ereignis-Daten auftaucht
   if (!goalPushed && gh + ga > N.gh + N.ga) {
     const fbScored = (fbHome ? gh > N.gh : ga > N.ga);
-    await push(env, { title: fbScored ? "⚽ TOR für Fenerbahçe!" : "Gegentor", message: line, tags: ["soccer"], priority: fbScored ? 5 : 4 });
+    await push(env, { title: fbScored ? "⚽ TOR für Fenerbahçe!" : "Gegentor", message: line + chanceLine(f), tags: ["soccer"], priority: fbScored ? 5 : 4 });
   }
   N.gh = gh; N.ga = ga;
 
   if (!N.ht && st === "HT") {
     N.ht = true;
-    await push(env, { title: "Halbzeit", message: line, tags: ["pause_button"], priority: 2 });
+    await push(env, { title: "Halbzeit", message: line + chanceLine(f), tags: ["pause_button"], priority: 2 });
   }
   if (!N.ft && FINISHED.indexOf(st) >= 0) {
     N.ft = true;
