@@ -11,9 +11,12 @@
   },
   "cloudflare": {
     "bindings": {
-      "API_KEY": { "description": "Dein Schlüssel von api-football.com (Dashboard → Account)." },
-      "NTFY_TOPIC": { "description": "Kanalname für die Push-Nachrichten. Genau diesen Namen in der ntfy-App abonnieren." },
-      "DB": { "description": "Kleine Datenbank, in der sich der Helfer den Spielstand merkt. Wird automatisch angelegt." }
+      "NTFY_TOPIC": {
+        "description": "Kanalname für die Push-Nachrichten. Genau diesen Namen in der ntfy-App abonnieren."
+      },
+      "DB": {
+        "description": "Kleine Datenbank, in der sich der Helfer den Spielstand merkt. Wird automatisch angelegt."
+      }
     }
   }
 }

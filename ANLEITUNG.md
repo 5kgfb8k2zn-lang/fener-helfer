@@ -6,7 +6,6 @@
    https://deploy.workers.cloudflare.com/?url=https://github.com/5kgfb8k2zn-lang/Fener-Simulator-/tree/claude/fenerbahce-football-simulation-vo094a/helfer
 3. Mit GitHub anmelden bzw. ein kostenloses Cloudflare-Konto anlegen.
 4. Im Formular:
-   - **API_KEY**: deinen Schlüssel von api-football.com einfügen
    - **NTFY_TOPIC**: den vorgeschlagenen Namen so lassen
    - Datenbank und Namen so lassen wie vorgeschlagen
 5. **Create and deploy** tippen und 1–2 Minuten warten.
@@ -19,9 +18,9 @@ Cloudflare legt dabei eine Kopie des Helfers in deinem GitHub-Konto an. Von dort
 
 ## Der Weg von Hand
 
-Der Helfer ist ein kleines Programm bei Cloudflare. Es läuft jede Minute, fragt aber nur rund um Fener-Spiele bei API-Football nach. Bei Anpfiff, Toren, Roten Karten, Halbzeit und Abpfiff schickt es dir eine Push-Nachricht über die App **ntfy**. Deine Fener-App holt sich alles vom Helfer und verbraucht selbst keine Anfragen mehr.
+Der Helfer ist ein kleines Programm bei Cloudflare. Es läuft jede Minute und holt die Fener-Spiele kostenlos von TheSportsDB. Bei Anpfiff, Toren, Roten Karten, Halbzeit und Abpfiff schickt es dir eine Push-Nachricht über die App **ntfy**. Deine Fener-App holt sich alles vom Helfer.
 
-Kosten: 0 € (Cloudflare Free-Plan, ntfy kostenlos, API-Football Free-Plan).
+Kosten: 0 € (Cloudflare Free-Plan, ntfy und TheSportsDB kostenlos). Ein API-Schlüssel wird nicht gebraucht.
 Dauer: ca. 15 Minuten. Am besten am Computer, am iPhone geht es aber auch.
 
 ---
@@ -60,8 +59,7 @@ Zurück zur Übersicht des Workers `fener-helfer` → Reiter **Settings**:
 
 **b) Geheime Werte**
 - **Variables and Secrets** → **Add**
-- Type **Secret**, Name `API_KEY`, Value: dein Schlüssel von api-football.com
-- Noch einmal **Add**: Type **Secret**, Name `NTFY_TOPIC`, Value: dein Kanalname aus Schritt 1
+- Type **Secret**, Name `NTFY_TOPIC`, Value: dein Kanalname aus Schritt 1
 - Optional: Type **Text**, Name `APP_URL`, Value `https://5kgfb8k2zn-lang.github.io/Fener-Simulator-/` (dann öffnet ein Tipp auf die Nachricht die App)
 - **Deploy**
 
@@ -84,13 +82,12 @@ Fertig! Ab jetzt bekommst du bei jedem Fener-Spiel Push-Nachrichten, auch wenn d
 ---
 
 ## Wenn etwas nicht klappt
-- **`/state` zeigt `"error": "API_KEY fehlt"`**: Schritt 5b prüfen, danach **Deploy** nicht vergessen.
 - **„Datenbank-Bindung DB fehlt“**: Schritt 5a, der Name muss genau `DB` sein.
 - **Keine Spiele nach ein paar Minuten**: Schritt 5c prüfen (Cron). Unter **Logs** im Worker siehst du Fehlermeldungen.
 - **Test-Nachricht kommt nicht an**: Ist der Kanalname in ntfy und in `NTFY_TOPIC` exakt gleich? Mitteilungen für ntfy erlaubt?
 
 ## Alternative: automatisch einrichten lassen
-Mit `helfer/deploy.sh` richtet ein Befehl alles ein (Datenbank, Worker, Cron, geheime Werte). Dafür braucht es die Umgebungsvariablen `CLOUDFLARE_API_TOKEN` (Rechte: Workers Scripts bearbeiten, D1 bearbeiten), `CLOUDFLARE_ACCOUNT_ID`, `API_FOOTBALL_KEY` und `NTFY_TOPIC`. Mit denselben Variablen spielt das Skript später auch Updates des Helfers ein.
+Mit `helfer/deploy.sh` richtet ein Befehl alles ein (Datenbank, Worker, Cron, geheime Werte). Dafür braucht es die Umgebungsvariablen `CLOUDFLARE_API_TOKEN` (Rechte: Workers Scripts bearbeiten, D1 bearbeiten), `CLOUDFLARE_ACCOUNT_ID` und `NTFY_TOPIC`. Mit denselben Variablen spielt das Skript später auch Updates des Helfers ein.
 
 ## Updates
 Die Fener-App selbst aktualisiert sich automatisch. Den Helfer-Code musst du nur neu einfügen (Schritt 4.3 bis 4.5), wenn Claude ausdrücklich sagt, dass sich der Helfer geändert hat.

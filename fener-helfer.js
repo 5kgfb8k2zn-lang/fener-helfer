@@ -1,26 +1,22 @@
 // Fener-Helfer – Cloudflare Worker
-// Fragt API-Football nur rund um Fenerbahçe-Spiele ab und schickt Push-Nachrichten über ntfy.
-// Die App holt sich den Stand über /state und verbraucht selbst keine Anfragen mehr.
+// Holt die Fenerbahçe-Spiele kostenlos von TheSportsDB und schickt Push-Nachrichten über ntfy.
+// Die App holt sich den Stand über /state.
 //
 // Benötigt in Cloudflare:
-//   Secret   API_KEY     – Schlüssel von api-football.com
 //   Secret   NTFY_TOPIC  – geheimer Kanalname in der ntfy-App
 //   D1       DB          – Datenbank-Bindung (Name der Variable: DB)
 //   Cron     * * * * *   – jede Minute
 // Optional: NTFY_SERVER (Standard https://ntfy.sh), APP_URL (Link beim Antippen der Nachricht)
 
-const API = "https://v3.football.api-sports.io";
 const SEASON = 2026;
-const VERSION = 7;
-const DAILY_LIMIT = 100;
-const CAP = 95; // 5 Anfragen bleiben als Reserve
+const VERSION = 8;
 const FINISHED = ["FT", "AET", "PEN"];
 const STOP = FINISHED.concat(["PST", "CANC", "ABD", "AWD", "WO"]);
 const PLAYING = ["1H", "2H", "HT", "ET", "BT", "P", "LIVE", "INT", "SUSP"];
 const LEAGUE_NAMES = { 203: "Süper Lig", 2: "Champions League", 206: "Türkiye Kupası" };
 
 // Welche Nachrichten verschickt werden (in der App unter Live → Hintergrund-Helfer einstellbar)
-const DEFAULT_PREFS = { reminder: true, lineup: true, kickoff: true, goals: true, oppgoals: true, cards: true, var: true, ht: true, ft: true, rivals: true, chance: true, stats: true };
+const DEFAULT_PREFS = { reminder: true, kickoff: true, goals: true, oppgoals: true, ht: true, ft: true, rivals: true, chance: true };
 let PREFS = Object.assign({}, DEFAULT_PREFS);
 function setPrefs(s) { PREFS = Object.assign({}, DEFAULT_PREFS, s.prefs || {}); }
 
@@ -91,7 +87,7 @@ async function ensureTable(env) {
   tableReady = true;
 }
 function emptyState() {
-  return { v: VERSION, teamId: null, fixtures: [], table: [], syncedAt: 0, syncFailAt: 0, live: null, lastLive: null, lineups: {}, lineupTry: {}, notified: {}, usage: { day: "", n: 0 }, lastPollAt: 0, error: "", testAt: 0, pushError: "", rivalIds: {}, rivalFx: [], rivalPollAt: 0, reminded: {} };
+  return { v: VERSION, teamId: null, fixtures: [], table: [], syncedAt: 0, syncFailAt: 0, live: null, lastLive: null, notified: {}, usage: { day: "", n: 0 }, lastPollAt: 0, error: "", testAt: 0, pushError: "", rivalIds: {}, rivalFx: [], rivalPollAt: 0, reminded: {} };
 }
 async function load(env) {
   await ensureTable(env);
@@ -103,12 +99,11 @@ async function save(env, s) {
   await ensureTable(env);
   await env.DB.prepare("INSERT OR REPLACE INTO store (k, v) VALUES (?, ?)").bind("state", JSON.stringify(s)).run();
 }
-function source(env) { return String(env.SOURCE || "thesportsdb").toLowerCase().indexOf("api") === 0 ? "apifootball" : "tsdb"; }
 function publicState(s, env) {
   return {
-    v: VERSION, now: Date.now(), source: source(env), syncedAt: s.syncedAt, fixtures: s.fixtures, table: s.table,
-    live: s.live, lastLive: s.lastLive, lineups: s.lineups, usage: s.usage, lastPollAt: s.lastPollAt,
-    error: s.error, pushError: s.pushError || "", push: !!env.NTFY_TOPIC, apiKey: source(env) === "tsdb" ? true : !!env.API_KEY,
+    v: VERSION, now: Date.now(), source: "tsdb", syncedAt: s.syncedAt, fixtures: s.fixtures, table: s.table,
+    live: s.live, lastLive: s.lastLive, usage: s.usage, lastPollAt: s.lastPollAt,
+    error: s.error, pushError: s.pushError || "", push: !!env.NTFY_TOPIC,
     prefs: Object.assign({}, DEFAULT_PREFS, s.prefs || {}),
     rivals: (s.rivalFx || []).map((r) => ({ id: r.id, date: r.date, h: r.h, a: r.a, st: r.st, gh: r.gh, ga: r.ga })),
   };
@@ -123,7 +118,7 @@ function setupPage(s, env, origin) {
   const n = s.fixtures.length ? nextFx(s, now) : null;
   const row = (ok, label, hint) => `<li class="${ok ? "ok" : "no"}"><b>${ok ? "✓" : "✗"}</b><span>${label}${hint ? `<small>${hint}</small>` : ""}</span></li>`;
   const checks = [
-    row(!!env.API_KEY, "API-Schlüssel eingetragen", env.API_KEY ? "" : "In Cloudflare unter Settings → Variables and Secrets: API_KEY"),
+    row(true, "Datenquelle TheSportsDB (kostenlos, kein Schlüssel nötig)"),
     row(!!env.NTFY_TOPIC, "Push-Kanal eingetragen", env.NTFY_TOPIC ? "" : "In Cloudflare unter Settings → Variables and Secrets: NTFY_TOPIC"),
     row(!!env.DB, "Datenbank verbunden"),
     row(!!s.syncedAt, "Spielplan geladen", s.syncedAt ? "Stand " + new Date(s.syncedAt).toLocaleString("de-DE", { timeZone: "Europe/Berlin" }) : "Passiert innerhalb einer Minute nach dem Einrichten. Seite dann neu laden."),
@@ -146,7 +141,7 @@ code{display:block;word-break:break-all;background:var(--bg);border:1px solid va
 </style></head><body><main>
 <h1>Fener-<span>Helfer</span></h1>
 <p>Läuft jede Minute bei Cloudflare und meldet dir die Fener-Spiele per Push, auch wenn die App zu ist.</p>
-<section class="card"><div class="label">Status</div><ul>${checks}</ul><small>Nächstes Spiel: ${next} · heute ${s.usage && s.usage.day === utcDay() ? s.usage.n : 0} von ${DAILY_LIMIT} Anfragen</small>${s.error ? `<small style="color:var(--no)">Problem: ${esc(s.error)}</small>` : ""}</section>
+<section class="card"><div class="label">Status</div><ul>${checks}</ul><small>Nächstes Spiel: ${next} · heute ${s.usage && s.usage.day === utcDay() ? s.usage.n : 0} Abfragen bei TheSportsDB (kein Tageslimit)</small>${s.error ? `<small style="color:var(--no)">Problem: ${esc(s.error)}</small>` : ""}</section>
 <section class="card"><div class="label">1 · Push-Nachrichten</div><p>ntfy aus dem App Store installieren, dann hier tippen:</p>${topic}${env.NTFY_TOPIC ? `<small>Kanal: <b>${esc(env.NTFY_TOPIC.trim())}</b> – genau dieser Name muss in der ntfy-App stehen.</small>` : ""}${s.pushError ? `<small style="color:var(--no)">Letzter Fehler beim Senden: ${esc(s.pushError)}</small>` : ""}<button class="ghost" id="test">Test-Nachricht senden</button><p id="msg"></p></section>
 <section class="card"><div class="label">2 · Mit der Fener-App verbinden</div><p>Adresse kopieren und in der Fener-App unter Live → Hintergrund-Helfer einfügen.</p><code id="u">${esc(origin)}</code><button id="copy">Adresse kopieren</button></section>
 <script>
@@ -163,26 +158,8 @@ function norm(x) { return String(x || "").replace(/ı/g, "i").replace(/İ/g, "I"
 function isFb(name) { return norm(name).indexOf("fenerbahce") >= 0; }
 function kick(a) { return Date.parse(a.date); }
 function sorted(s) { return s.fixtures.slice().sort((x, y) => kick(x) - kick(y)); }
-function windowFx(s, now) {
-  return sorted(s).find((a) => STOP.indexOf(a.st) < 0 && now >= kick(a) - 5 * 60000 && now <= kick(a) + 150 * 60000) || null;
-}
 function nextFx(s, now) { return sorted(s).find((a) => STOP.indexOf(a.st) < 0 && kick(a) > now - 150 * 60000) || null; }
 
-async function api(env, s, path) {
-  if (s.usage.day !== utcDay()) s.usage = { day: utcDay(), n: 0 };
-  if (s.usage.n >= CAP) throw new Error("Tageslimit erreicht (" + s.usage.n + " von " + DAILY_LIMIT + ").");
-  s.usage.n++;
-  const key = String(env.API_KEY).trim().replace(/^["']|["']$/g, "");
-  const r = await fetch(API + path, { headers: { "x-apisports-key": key } });
-  const rem = r.headers.get("x-ratelimit-requests-remaining");
-  if (rem !== null && !isNaN(+rem)) s.usage.n = Math.max(s.usage.n, DAILY_LIMIT - +rem);
-  const j = await r.json();
-  const e = j && j.errors;
-  if (e && (Array.isArray(e) ? e.length : Object.keys(e).length)) {
-    throw new Error("API: " + (Array.isArray(e) ? e.join(" ") : Object.values(e).join(" ")));
-  }
-  return j.response || [];
-}
 
 // Schickt eine Nachricht an ntfy. Gibt { ok, error } zurück.
 // Optional: NTFY_TOKEN (Zugangs-Token eines kostenlosen ntfy-Kontos), falls ntfy Anfragen von Cloudflare drosselt.
@@ -268,51 +245,6 @@ function chanceLine(f) {
   return "\nSiegchance jetzt " + pct(c.w) + " · Remis " + pct(c.d);
 }
 
-// ---------------------------------------------------------------------------
-// Abgleich: Spielplan + Tabelle (2 Anfragen, beim ersten Mal 3)
-// ---------------------------------------------------------------------------
-function needSync(s, now) {
-  if (s.syncFailAt && now - s.syncFailAt < 30 * 60000) return false; // nach Fehler 30 Min. warten
-  if (!s.syncedAt || !s.fixtures.length) return true;
-  if (now - s.syncedAt > 24 * 3600 * 1000) return true;
-  return s.fixtures.some((a) => { const end = kick(a) + 120 * 60000; return end > s.syncedAt && end < now; });
-}
-async function sync(env, s) {
-  if (!s.teamId) {
-    const res = await api(env, s, "/teams?search=Fenerbahce");
-    const t = res.find((x) => x.team && isFb(x.team.name) && !/W$|U\d+/.test(x.team.name));
-    if (!t) throw new Error("Fenerbahçe wurde bei API-Football nicht gefunden.");
-    s.teamId = t.team.id;
-  }
-  const fx = await api(env, s, "/fixtures?team=" + s.teamId + "&season=" + SEASON);
-  const st = await api(env, s, "/standings?league=203&season=" + SEASON);
-  if (!fx.length) throw new Error("Keine Spiele für die Saison " + SEASON + " gefunden. Der Free-Plan enthält die Saison eventuell nicht.");
-  s.fixtures = fx.map((f) => ({
-    id: f.fixture.id, date: f.fixture.date, st: f.fixture.status.short, lg: f.league.id, round: f.league.round,
-    h: f.teams.home.name, a: f.teams.away.name, gh: f.goals.home, ga: f.goals.away,
-    ph: f.score && f.score.penalty ? f.score.penalty.home : null, pa: f.score && f.score.penalty ? f.score.penalty.away : null,
-  }));
-  const rows = (st[0] && st[0].league && st[0].league.standings && st[0].league.standings[0]) || [];
-  s.table = rows.map((t) => ({ n: t.team.name, p: t.all.played, pts: t.points, gf: t.all.goals.for, ga: t.all.goals.against }));
-  s.rivalIds = {};
-  rows.forEach((t) => { const r = RIVALS.find((x) => norm(t.team.name).indexOf(x[0]) >= 0); if (r) s.rivalIds[t.team.id] = r[1]; });
-  if (Object.keys(s.rivalIds).length) {
-    try {
-      const from = utcDay(), to = new Date(Date.now() + 8 * 86400000).toISOString().slice(0, 10);
-      const lf = await api(env, s, "/fixtures?league=203&season=" + SEASON + "&from=" + from + "&to=" + to);
-      const keep = (s.rivalFx || []).filter((r) => !r.done && Date.now() - Date.parse(r.date) < 8 * 3600 * 1000);
-      lf.forEach((f) => {
-        const hid = f.teams.home.id, aid = f.teams.away.id;
-        if (!(s.rivalIds[hid] || s.rivalIds[aid]) || isFb(f.teams.home.name) || isFb(f.teams.away.name)) return;
-        if (keep.some((k) => k.id === f.fixture.id)) return;
-        keep.push({ id: f.fixture.id, date: f.fixture.date, h: f.teams.home.name, a: f.teams.away.name, hid: hid, aid: aid, st: f.fixture.status.short, gh: f.goals.home, ga: f.goals.away, done: FINISHED.indexOf(f.fixture.status.short) >= 0 });
-      });
-      s.rivalFx = keep;
-    } catch (e) { console.log("Rivalen-Spiele nicht geladen:", e); }
-  }
-  s.syncedAt = Date.now();
-  s.syncFailAt = 0;
-}
 
 // ---------------------------------------------------------------------------
 // Jede Minute
@@ -320,94 +252,7 @@ async function sync(env, s) {
 async function tick(env) {
   const s = await load(env);
   setPrefs(s);
-  const now = Date.now();
-  if (source(env) === "tsdb") return tickTsdb(env, s, now);
-  let dirty = false;
-  if (s.usage.day !== utcDay()) { s.usage = { day: utcDay(), n: 0 }; dirty = true; }
-  if (!env.API_KEY) {
-    if (s.error !== "API_KEY fehlt") { s.error = "API_KEY fehlt"; await save(env, s); }
-    return;
-  }
-  // Neuer Schlüssel eingetragen? Dann sofort neu versuchen statt 30 Minuten zu warten
-  const fp = String(env.API_KEY).trim().slice(-4) + ":" + String(env.API_KEY).trim().length;
-  if (s.keyFp !== fp) { s.keyFp = fp; s.syncFailAt = 0; s.error = ""; dirty = true; }
-
-  if (needSync(s, now)) {
-    try { await sync(env, s); s.error = ""; } catch (e) { s.error = String(e.message || e); s.syncFailAt = now; }
-    dirty = true;
-  }
-
-  const w = windowFx(s, now);
-  if (w) {
-    const live = s.live && s.live.fixture.id === w.id ? s.live : null;
-    const iv = pollInterval(s, w, live, now);
-    if (iv && now - s.lastPollAt >= iv * 1000 - 5000) {
-      try {
-        const res = await api(env, s, "/fixtures?id=" + w.id);
-        s.lastPollAt = now;
-        const raw = res[0];
-        if (raw && !(raw.statistics && raw.statistics.length) && PLAYING.indexOf(raw.fixture.status.short) >= 0) {
-          const prevStats = s.live && s.live.fixture.id === w.id ? s.live.stats : null;
-          if (prevStats) raw.statistics = null;
-          if (now - (s.statsAt || 0) >= 10 * 60000 && s.usage.n < CAP - 25) {
-            s.statsAt = now;
-            try { raw.statistics = await api(env, s, "/fixtures/statistics?fixture=" + w.id); } catch (e) { /* ohne Statistik weiter */ }
-          }
-          if (!(raw.statistics && raw.statistics.length) && prevStats) raw._keepStats = prevStats;
-        }
-        if (raw) await handleUpdate(env, s, w, raw);
-        s.error = "";
-      } catch (e) { s.error = String(e.message || e); }
-      dirty = true;
-    }
-  }
-
-  // Aufstellung (kommt ca. 60 Minuten vor Anpfiff)
-  const n = w || nextFx(s, now);
-  if (n && now >= kick(n) - 60 * 60000 && !s.lineups[n.id]) {
-    const t = s.lineupTry[n.id] || { n: 0, at: 0 };
-    if (t.n < 4 && now - t.at >= 14 * 60000) {
-      s.lineupTry = { [n.id]: { n: t.n + 1, at: now } };
-      try {
-        const res = await api(env, s, "/fixtures/lineups?fixture=" + n.id);
-        const mine = res.find((x) => isFb(x.team.name));
-        if (mine && mine.startXI && mine.startXI.length) {
-          s.lineups = { [n.id]: { team: { name: mine.team.name }, formation: mine.formation, coach: mine.coach ? { name: mine.coach.name } : null, startXI: mine.startXI.map((x) => ({ player: { name: x.player.name, number: x.player.number, pos: x.player.pos } })) } };
-          await push(env, { cat: "lineup", title: "Aufstellung Fenerbahçe", message: (mine.formation ? mine.formation + ": " : "") + mine.startXI.map((x) => x.player.name).join(", "), tags: ["clipboard"], priority: 2 });
-        }
-      } catch (e) { s.error = String(e.message || e); }
-      dirty = true;
-    }
-  }
-
-  if (await maybeRemind(env, s, now)) dirty = true;
-
-  // Rivalen-Alarm: Endergebnis von Galatasaray, Beşiktaş, Trabzonspor (nur wenn das Budget für Fener sicher reicht)
-  if (!w && s.rivalFx && s.rivalFx.length && now - (s.rivalPollAt || 0) >= 10 * 60000) {
-    const due = s.rivalFx.filter((r) => !r.done && now >= kick(r) + 112 * 60000 && now <= kick(r) + 6 * 3600 * 1000);
-    const fenerLater = s.fixtures.some((a) => STOP.indexOf(a.st) < 0 && kick(a) > now && berlinDay(kick(a)) === berlinDay(now));
-    const budgetOk = s.usage.n < (fenerLater ? CAP - 90 : CAP - 8);
-    if (due.length && budgetOk) {
-      s.rivalPollAt = now;
-      try {
-        const res = await api(env, s, "/fixtures?ids=" + due.slice(0, 20).map((r) => r.id).join("-"));
-        for (const f of res) {
-          const r = s.rivalFx.find((x) => x.id === f.fixture.id);
-          if (!r) continue;
-          r.st = f.fixture.status.short; r.gh = f.goals.home; r.ga = f.goals.away;
-          if (["PST", "CANC", "ABD", "AWD", "WO"].indexOf(r.st) >= 0) { r.done = true; continue; }
-          if (FINISHED.indexOf(r.st) >= 0) { r.done = true; await pushRival(env, s, r); }
-        }
-      } catch (e) { s.error = String(e.message || e); }
-      dirty = true;
-    }
-    // Zu alte Einträge aufräumen
-    const before = s.rivalFx.length;
-    s.rivalFx = s.rivalFx.filter((r) => !(r.done && now - kick(r) > 24 * 3600 * 1000) && now - kick(r) < 8 * 3600 * 1000 + 24 * 3600 * 1000);
-    if (s.rivalFx.length !== before) dirty = true;
-  }
-
-  if (dirty) await save(env, s);
+  return tickTsdb(env, s, Date.now());
 }
 
 async function maybeRemind(env, s, now) {
@@ -449,162 +294,14 @@ async function pushRival(env, s, r) {
   await push(env, { cat: "rivals", title: title, message: msg, tags: res === "l" ? ["tada"] : res === "d" ? ["neutral_face"] : ["pensive"], priority: res === "w" ? 2 : 3 });
 }
 
-// Das Tagesbudget gleichmäßig auf die restliche Spielzeit verteilen (ca. alle 60–80 Sekunden)
-function pollInterval(s, w, live, now) {
-  const st = live ? live.fixture.status.short : "NS";
-  const extra = ["ET", "BT", "P"].indexOf(st) >= 0;
-  const end = kick(w) + (extra ? 170 : 125) * 60000;
-  let secsLeft = Math.max(300, (end - now) / 1000);
-  if (!extra && st !== "2H") secsLeft -= 15 * 60;
-  if (s.usage.day !== utcDay()) s.usage = { day: utcDay(), n: 0 };
-  const left = CAP - s.usage.n - 3;
-  if (left <= 0) return null;
-  let iv = Math.max(55, Math.ceil(secsLeft / left));
-  if (st === "HT") iv = Math.max(iv, 7 * 60);
-  if (now < kick(w)) iv = Math.max(55, Math.min(iv, (kick(w) - now) / 1000 + 30));
-  return iv;
-}
 
-// ---------------------------------------------------------------------------
-// Neue Ereignisse erkennen und melden
-// ---------------------------------------------------------------------------
-function slim(f) {
-  return {
-    fixture: { id: f.fixture.id, date: f.fixture.date, status: { short: f.fixture.status.short, elapsed: f.fixture.status.elapsed, extra: f.fixture.status.extra || null } },
-    league: { id: f.league.id, name: f.league.name, round: f.league.round },
-    teams: { home: { name: f.teams.home.name }, away: { name: f.teams.away.name } },
-    goals: { home: f.goals.home, away: f.goals.away },
-    score: { penalty: f.score && f.score.penalty ? { home: f.score.penalty.home, away: f.score.penalty.away } : { home: null, away: null } },
-    events: (f.events || []).map((e) => ({
-      time: { elapsed: e.time.elapsed, extra: e.time.extra }, team: { name: e.team ? e.team.name : "" },
-      player: { name: e.player ? e.player.name : "" }, assist: { name: e.assist ? e.assist.name : null },
-      type: e.type, detail: e.detail,
-    })),
-    stats: slimStats(f.statistics, f.teams.home.name),
-  };
-}
-// Statistiken kompakt: [{ t: Typ, h: Heim, a: Gast }]
-const STAT_TYPES = ["Ball Possession", "expected_goals", "Total Shots", "Shots on Goal", "Corner Kicks", "Fouls", "Offsides", "Goalkeeper Saves", "Passes %", "Yellow Cards", "Red Cards"];
-function slimStats(list, homeName) {
-  if (!Array.isArray(list) || list.length < 2) return null;
-  const home = list.find((x) => x.team && x.team.name === homeName) || list[0];
-  const away = list.find((x) => x !== home) || list[1];
-  const val = (side, t) => { const r = (side.statistics || []).find((x) => x.type === t); return r ? r.value : null; };
-  const out = STAT_TYPES.map((t) => ({ t: t, h: val(home, t), a: val(away, t) })).filter((x) => x.h !== null || x.a !== null);
-  return out.length ? out : null;
-}
-function statVal(f, t) { const r = (f.stats || []).find((x) => x.t === t); return r ? [r.h, r.a] : null; }
-function statsLine(f) {
-  if (!PREFS.stats) return "";
-  const p = statVal(f, "Ball Possession"), sh = statVal(f, "Total Shots"), xg = statVal(f, "expected_goals");
-  const parts = [];
-  if (p) parts.push("Ballbesitz " + String(p[0]).replace("%", "") + ":" + String(p[1]).replace("%", ""));
-  if (sh) parts.push("Schüsse " + (sh[0] || 0) + ":" + (sh[1] || 0));
-  if (xg) parts.push("xG " + (xg[0] || 0) + ":" + (xg[1] || 0));
-  return parts.length ? "\n" + parts.join(" · ") : "";
-}
 
-function evKey(e) { return [e.time.elapsed, e.time.extra || 0, e.type, e.detail, e.team && e.team.name, e.player && e.player.name].join("|"); }
-function minute(e) { return e.time.elapsed + (e.time.extra ? "+" + e.time.extra : "") + "'"; }
 
-async function handleUpdate(env, s, w, raw) {
-  const f = slim(raw);
-  if (!f.stats && raw._keepStats) f.stats = raw._keepStats;
-  const id = f.fixture.id;
-  if (!s.notified[id]) s.notified = { [id]: { ev: [], ko: false, ht: false, ft: false, gh: 0, ga: 0, init: false } };
-  const N = s.notified[id];
-  const st = f.fixture.status.short;
-  const h = f.teams.home.name, a = f.teams.away.name;
-  const gh = f.goals.home || 0, ga = f.goals.away || 0;
-  const line = h + " " + gh + ":" + ga + " " + a;
-  const comp = LEAGUE_NAMES[f.league.id] || f.league.name || "";
-  const fbHome = isFb(h);
-
-  // Der Helfer wurde erst während des Spiels gestartet: alte Ereignisse nicht nachmelden
-  if (!N.init) {
-    N.init = true;
-    if (PLAYING.indexOf(st) >= 0 && (f.events.length || (f.fixture.status.elapsed || 0) > 3)) {
-      N.ko = true; N.ev = f.events.map(evKey); N.gh = gh; N.ga = ga; if (st === "HT") N.ht = true;
-      await push(env, { cat: "kickoff", title: "Fener live · " + comp, message: "Der Helfer ist dabei: " + line + " (" + (f.fixture.status.elapsed || 0) + "')", tags: ["soccer"], priority: 3 });
-    }
-  }
-
-  if (!N.ko && PLAYING.indexOf(st) >= 0) {
-    N.ko = true;
-    await push(env, { cat: "kickoff", title: "Anpfiff · " + comp, message: h + " – " + a + " läuft!", tags: ["stopwatch"], priority: 3 });
-  }
-
-  let goalPushed = false;
-  for (const e of f.events) {
-    const k = evKey(e);
-    if (N.ev.indexOf(k) >= 0) continue;
-    N.ev.push(k);
-    const fb = isFb(e.team.name);
-    if (e.type === "Goal" && e.detail !== "Missed Penalty") {
-      goalPushed = true;
-      const how = e.detail === "Penalty" ? " (Elfmeter)" : e.detail === "Own Goal" ? " (Eigentor)" : "";
-      const as = e.assist && e.assist.name ? ", Vorlage " + e.assist.name : "";
-      await push(env, fb
-        ? { cat: "goals", title: "⚽ TOR für Fenerbahçe!", message: e.player.name + how + " " + minute(e) + as + "\n" + line + chanceLine(f), tags: ["soccer", "yellow_heart", "blue_heart"], priority: 5 }
-        : { cat: "oppgoals", title: "Gegentor · " + e.team.name, message: e.player.name + how + " " + minute(e) + "\n" + line + chanceLine(f), tags: ["soccer"], priority: 4 });
-    } else if (e.type === "Goal" && e.detail === "Missed Penalty") {
-      await push(env, { cat: "cards", title: "Elfmeter verschossen", message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line, tags: ["x"], priority: 3 });
-    } else if (e.type === "Card" && /Red|Second/.test(e.detail)) {
-      await push(env, { cat: "cards", title: "🟥 Rote Karte" + (fb ? " für Fener" : ""), message: e.player.name + " (" + e.team.name + ") " + minute(e) + "\n" + line + chanceLine(f), tags: ["red_circle"], priority: 4 });
-    } else if (e.type === "Var" && /cancel|disallow/i.test(e.detail || "")) {
-      await push(env, { cat: "var", title: "Videobeweis: Tor zurückgenommen", message: (e.player.name ? e.player.name + " " : "") + minute(e) + "\n" + line, tags: ["tv"], priority: 4 });
-    }
-  }
-  // Falls ein Tor ohne Ereignis-Daten auftaucht
-  if (!goalPushed && gh + ga > N.gh + N.ga) {
-    const fbScored = (fbHome ? gh > N.gh : ga > N.ga);
-    await push(env, { cat: fbScored ? "goals" : "oppgoals", title: fbScored ? "⚽ TOR für Fenerbahçe!" : "Gegentor", message: line + chanceLine(f), tags: ["soccer"], priority: fbScored ? 5 : 4 });
-  }
-  N.gh = gh; N.ga = ga;
-
-  if (!N.ht && st === "HT") {
-    N.ht = true;
-    await push(env, { cat: "ht", title: "Halbzeit", message: line + statsLine(f) + chanceLine(f), tags: ["pause_button"], priority: 2 });
-  }
-  if (!N.ft && FINISHED.indexOf(st) >= 0) {
-    N.ft = true;
-    const fg = fbHome ? gh : ga, og = fbHome ? ga : gh;
-    let verdict = fg > og ? "Sieg! 💛💙" : fg < og ? "Niederlage." : "Unentschieden.";
-    const ph = f.score.penalty.home, pa = f.score.penalty.away;
-    if (ph !== null && pa !== null) verdict = ((fbHome ? ph > pa : pa > ph) ? "Weiter im Elfmeterschießen! " : "Raus im Elfmeterschießen. ") + ph + ":" + pa + " i.E.";
-    await push(env, { cat: "ft", title: "Abpfiff · " + comp, message: line + "\n" + verdict + statsLine(f), tags: ["checkered_flag"], priority: 4 });
-    N.ftPending = true;
-  }
-
-  // Verlauf der Siegchance für die Grafik in der App
-  if (!s.chanceLog || s.chanceLog.id !== id) {
-    const opp = fbHome ? a : h;
-    const neutral = /final/i.test(f.league.round || "") && f.league.id !== 203;
-    const pre = outcome(FB_RATING, rating(opp, f.league.id), neutral ? 0 : fbHome ? 3 : -3, [0, 0], 1, 0, 0);
-    s.chanceLog = { id: id, pts: [{ m: 0, w: Math.round(pre.w * 100), d: Math.round(pre.d * 100) }] };
-  }
-  const el = (f.fixture.status.elapsed || 0) + (f.fixture.status.extra || 0);
-  const lastPt = s.chanceLog.pts[s.chanceLog.pts.length - 1];
-  if (FINISHED.indexOf(st) >= 0) {
-    const fg = fbHome ? gh : ga, og = fbHome ? ga : gh;
-    if (lastPt.m < 200) s.chanceLog.pts.push({ m: Math.max(90, el, lastPt.m + 1), w: fg > og ? 100 : 0, d: fg === og ? 100 : 0, end: true });
-  } else {
-    const c = liveChance(f);
-    if (c && el > lastPt.m) s.chanceLog.pts.push({ m: el, w: Math.round(c.w * 100), d: Math.round(c.d * 100) });
-  }
-  f.chance = s.chanceLog.pts;
-  if (N.ftPending) { N.ftPending = false; s.lastLive = f; }
-
-  // Spielplan mit dem Live-Stand aktuell halten
-  const fx = s.fixtures.find((x) => x.id === id);
-  if (fx) { fx.st = st; fx.gh = f.goals.home; fx.ga = f.goals.away; fx.ph = f.score.penalty.home; fx.pa = f.score.penalty.away; }
-  s.live = f;
-}
 
 // ===========================================================================
 // Datenquelle TheSportsDB (kostenlos, für private Projekte erlaubt)
 // Kein Live-Ticker im Free-Plan: Spielstände kommen, sobald TheSportsDB sie einträgt.
-// Abgefragt wird während eines Fener-Spiels alle 5 Minuten, danach alle 15 Minuten bis zum Endergebnis.
+// Abgefragt wird während eines Fener-Spiels jede Minute, danach alle 10 Minuten bis zum Endergebnis.
 // ===========================================================================
 const TSDB = "https://www.thesportsdb.com/api/v1/json/";
 const TSDB_FENER = 133807;            // Fenerbahçe bei TheSportsDB (wird beim ersten Mal per Suche geprüft)
@@ -710,7 +407,7 @@ async function syncTsdb(env, s, now) {
 async function tickTsdb(env, s, now) {
   let dirty = false;
   if (s.source !== "tsdb") {
-    // Umstieg von API-Football: alte Daten verwerfen
+    // Alte Daten aus früheren Versionen verwerfen
     Object.assign(s, { source: "tsdb", fixtures: [], table: [], rivalFx: [], rivalIds: {}, notified: {}, live: null, lastLive: null, syncedAt: 0, syncFailAt: 0, error: "", tsdb: {}, chanceLog: null });
     dirty = true;
   }
@@ -724,7 +421,7 @@ async function tickTsdb(env, s, now) {
   // Fener-Spiel: von Anpfiff bis Endergebnis beobachten
   const w = sorted(s).find((a) => STOP.indexOf(a.st) < 0 && now >= kick(a) - 5 * 60000 && now <= kick(a) + 8 * 3600 * 1000);
   if (w) {
-    const iv = now < kick(w) + 130 * 60000 ? 5 * 60000 : 15 * 60000;
+    const iv = now < kick(w) + 130 * 60000 ? 60000 : 10 * 60000; // während des Spiels jede Minute, danach alle 10 Minuten
     if (now - (s.lastPollAt || 0) >= iv - 5000) {
       s.lastPollAt = now;
       try {
@@ -774,7 +471,7 @@ async function handleTsdb(env, s, w, c) {
   const f = tsLive(c);
   const mins = (Date.now() - kick(c)) / 60000;
   f.fixture.status.elapsed = c.st === "HT" ? 45 : Math.max(0, Math.min(90, Math.round(mins > 60 ? mins - 15 : Math.min(45, mins))));
-  if (!N.ko && PLAYING.indexOf(c.st) >= 0) { N.ko = true; await push(env, { cat: "kickoff", title: "Anpfiff · " + comp, message: c.h + " – " + c.a + " läuft! Spielstände kommen von TheSportsDB und können ein paar Minuten verzögert sein.", tags: ["stopwatch"], priority: 3 }); }
+  if (!N.ko && PLAYING.indexOf(c.st) >= 0) { N.ko = true; await push(env, { cat: "kickoff", title: "Anpfiff · " + comp, message: c.h + " – " + c.a + " läuft! Spielstände kommen von TheSportsDB und können verzögert sein.", tags: ["stopwatch"], priority: 3 }); }
   if (FINISHED.indexOf(c.st) < 0 && gh + ga > N.gh + N.ga) {
     const fbScored = fbHome ? gh > N.gh : ga > N.ga;
     await push(env, { cat: fbScored ? "goals" : "oppgoals", title: fbScored ? "⚽ TOR für Fenerbahçe!" : "Gegentor", message: line + chanceLine(f) + "\n(Stand laut TheSportsDB, evtl. verzögert)", tags: ["soccer"], priority: fbScored ? 5 : 4 });
@@ -787,6 +484,22 @@ async function handleTsdb(env, s, w, c) {
     await push(env, { cat: "ft", title: "Endergebnis · " + comp, message: line + "\n" + (fg > og ? "Sieg! 💛💙" : fg < og ? "Niederlage." : "Unentschieden."), tags: ["checkered_flag"], priority: 4 });
     s.lastLive = f;
   }
+  // Verlauf der Siegchance für die Grafik in der App
+  if (!s.chanceLog || s.chanceLog.id !== id) {
+    const opp = fbHome ? c.a : c.h;
+    const pre = outcome(FB_RATING, rating(opp, c.lg), fbHome ? 3 : -3, [0, 0], 1, 0, 0);
+    s.chanceLog = { id: id, pts: [{ m: 0, w: Math.round(pre.w * 100), d: Math.round(pre.d * 100) }] };
+  }
+  const lastPt = s.chanceLog.pts[s.chanceLog.pts.length - 1];
+  if (FINISHED.indexOf(c.st) >= 0 && c.gh !== null) {
+    const fg = fbHome ? gh : ga, og = fbHome ? ga : gh;
+    if (!lastPt.end) s.chanceLog.pts.push({ m: Math.max(90, lastPt.m + 1), w: fg > og ? 100 : 0, d: fg === og ? 100 : 0, end: true });
+  } else if (PLAYING.indexOf(c.st) >= 0) {
+    const ch = liveChance(f), el = f.fixture.status.elapsed || 0;
+    if (ch && el > lastPt.m) s.chanceLog.pts.push({ m: el, w: Math.round(ch.w * 100), d: Math.round(ch.d * 100) });
+  }
+  f.chance = s.chanceLog.pts;
+  if (s.lastLive && s.lastLive.fixture.id === id) s.lastLive = f;
   upsert(s.fixtures, c);
   s.live = f;
 }
