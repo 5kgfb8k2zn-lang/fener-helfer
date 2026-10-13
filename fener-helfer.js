@@ -11,7 +11,7 @@
 
 const API = "https://v3.football.api-sports.io";
 const SEASON = 2026;
-const VERSION = 3;
+const VERSION = 4;
 const DAILY_LIMIT = 100;
 const CAP = 95; // 5 Anfragen bleiben als Reserve
 const FINISHED = ["FT", "AET", "PEN"];
@@ -317,7 +317,17 @@ async function tick(env) {
       try {
         const res = await api(env, s, "/fixtures?id=" + w.id);
         s.lastPollAt = now;
-        if (res[0]) await handleUpdate(env, s, w, res[0]);
+        const raw = res[0];
+        if (raw && !(raw.statistics && raw.statistics.length) && PLAYING.indexOf(raw.fixture.status.short) >= 0) {
+          const prevStats = s.live && s.live.fixture.id === w.id ? s.live.stats : null;
+          if (prevStats) raw.statistics = null;
+          if (now - (s.statsAt || 0) >= 10 * 60000 && s.usage.n < CAP - 25) {
+            s.statsAt = now;
+            try { raw.statistics = await api(env, s, "/fixtures/statistics?fixture=" + w.id); } catch (e) { /* ohne Statistik weiter */ }
+          }
+          if (!(raw.statistics && raw.statistics.length) && prevStats) raw._keepStats = prevStats;
+        }
+        if (raw) await handleUpdate(env, s, w, raw);
         s.error = "";
       } catch (e) { s.error = String(e.message || e); }
       dirty = true;
@@ -436,13 +446,35 @@ function slim(f) {
       player: { name: e.player ? e.player.name : "" }, assist: { name: e.assist ? e.assist.name : null },
       type: e.type, detail: e.detail,
     })),
+    stats: slimStats(f.statistics, f.teams.home.name),
   };
 }
+// Statistiken kompakt: [{ t: Typ, h: Heim, a: Gast }]
+const STAT_TYPES = ["Ball Possession", "expected_goals", "Total Shots", "Shots on Goal", "Corner Kicks", "Fouls", "Offsides", "Goalkeeper Saves", "Passes %", "Yellow Cards", "Red Cards"];
+function slimStats(list, homeName) {
+  if (!Array.isArray(list) || list.length < 2) return null;
+  const home = list.find((x) => x.team && x.team.name === homeName) || list[0];
+  const away = list.find((x) => x !== home) || list[1];
+  const val = (side, t) => { const r = (side.statistics || []).find((x) => x.type === t); return r ? r.value : null; };
+  const out = STAT_TYPES.map((t) => ({ t: t, h: val(home, t), a: val(away, t) })).filter((x) => x.h !== null || x.a !== null);
+  return out.length ? out : null;
+}
+function statVal(f, t) { const r = (f.stats || []).find((x) => x.t === t); return r ? [r.h, r.a] : null; }
+function statsLine(f) {
+  const p = statVal(f, "Ball Possession"), sh = statVal(f, "Total Shots"), xg = statVal(f, "expected_goals");
+  const parts = [];
+  if (p) parts.push("Ballbesitz " + String(p[0]).replace("%", "") + ":" + String(p[1]).replace("%", ""));
+  if (sh) parts.push("Schüsse " + (sh[0] || 0) + ":" + (sh[1] || 0));
+  if (xg) parts.push("xG " + (xg[0] || 0) + ":" + (xg[1] || 0));
+  return parts.length ? "\n" + parts.join(" · ") : "";
+}
+
 function evKey(e) { return [e.time.elapsed, e.time.extra || 0, e.type, e.detail, e.team && e.team.name, e.player && e.player.name].join("|"); }
 function minute(e) { return e.time.elapsed + (e.time.extra ? "+" + e.time.extra : "") + "'"; }
 
 async function handleUpdate(env, s, w, raw) {
   const f = slim(raw);
+  if (!f.stats && raw._keepStats) f.stats = raw._keepStats;
   const id = f.fixture.id;
   if (!s.notified[id]) s.notified = { [id]: { ev: [], ko: false, ht: false, ft: false, gh: 0, ga: 0, init: false } };
   const N = s.notified[id];
@@ -497,7 +529,7 @@ async function handleUpdate(env, s, w, raw) {
 
   if (!N.ht && st === "HT") {
     N.ht = true;
-    await push(env, { title: "Halbzeit", message: line + chanceLine(f), tags: ["pause_button"], priority: 2 });
+    await push(env, { title: "Halbzeit", message: line + statsLine(f) + chanceLine(f), tags: ["pause_button"], priority: 2 });
   }
   if (!N.ft && FINISHED.indexOf(st) >= 0) {
     N.ft = true;
@@ -505,7 +537,7 @@ async function handleUpdate(env, s, w, raw) {
     let verdict = fg > og ? "Sieg! 💛💙" : fg < og ? "Niederlage." : "Unentschieden.";
     const ph = f.score.penalty.home, pa = f.score.penalty.away;
     if (ph !== null && pa !== null) verdict = ((fbHome ? ph > pa : pa > ph) ? "Weiter im Elfmeterschießen! " : "Raus im Elfmeterschießen. ") + ph + ":" + pa + " i.E.";
-    await push(env, { title: "Abpfiff · " + comp, message: line + "\n" + verdict, tags: ["checkered_flag"], priority: 4 });
+    await push(env, { title: "Abpfiff · " + comp, message: line + "\n" + verdict + statsLine(f), tags: ["checkered_flag"], priority: 4 });
     s.lastLive = f;
   }
 
